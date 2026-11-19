@@ -252,18 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_overage_keeps_the_windows() {
-        let d = normalize(&payload(None), "key").unwrap();
-        assert_eq!(d.overage_micros, None);
-        assert_eq!(d.windows.len(), 1);
-        assert_eq!(d.windows[0].used_percent, 30.0);
-    }
-
-    #[test]
-    fn null_overage_keeps_the_windows() {
-        let d = normalize(&payload(Some(serde_json::Value::Null)), "key").unwrap();
-        assert_eq!(d.overage_micros, None);
-        assert_eq!(d.windows.len(), 1);
+    fn missing_or_null_overage_keeps_the_windows() {
+        for overage in [None, Some(serde_json::Value::Null)] {
+            let d = normalize(&payload(overage.clone()), "key").unwrap();
+            assert_eq!(d.overage_micros, None, "{overage:?}");
+            assert_eq!(d.windows.len(), 1, "{overage:?}");
+            assert_eq!(d.windows[0].used_percent, 30.0, "{overage:?}");
+        }
     }
 
     #[test]

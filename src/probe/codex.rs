@@ -338,12 +338,9 @@ fn response_result(msg: &serde_json::Value) -> Result<serde_json::Value, ProbeEr
 }
 
 /// Stop the child and anything it started (the npm shim runs node, which runs
-/// codex). The child was spawned in its own process group, so kill the group:
-/// SIGTERM, up to 1 s for the child to exit, then SIGKILL for whatever of the
-/// group is left, which would otherwise keep stdout open and block the reader.
-/// The rest of the group gets no grace of its own past the child's exit: the
-/// npm shim exits after codex does, and a probe that waited out the full
-/// second on every poll would gain nothing for a read-only call.
+/// codex) by signalling its process group: SIGTERM, up to 1 s for the child to
+/// exit, then SIGKILL for what is left of the group, which would otherwise
+/// keep stdout open and block the reader.
 fn kill_tree(child: &mut Child) {
     drop(child.stdin.take());
     let pgid = child.id() as libc::pid_t;
@@ -785,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn response_without_result_is_failed() {
+    fn response_result_is_the_result_the_error_or_failed() {
         let e = response_result(&serde_json::json!({"id": 1})).err().unwrap();
         assert_eq!(e.code, ErrorCode::Failed);
         let ok = response_result(&serde_json::json!({"id": 1, "result": {"rateLimits": {}}})).unwrap();
