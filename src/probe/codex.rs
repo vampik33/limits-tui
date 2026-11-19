@@ -21,6 +21,9 @@ const SHELL_OUTPUT_CAP: usize = 64 * 1024;
 /// How long the login shell's stdout may stay open after the shell exits
 /// before the background jobs it left holding it are killed.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
+/// Printed by the login-shell lookup before its answer, so the login config's
+/// own output (printed earlier) can't be mistaken for it.
+const LOGIN_MARKER: &str = "@@limits-tui@@";
 
 /// The login shell's stdout, read without blocking, and the last
 /// SHELL_OUTPUT_CAP bytes it printed.
@@ -105,9 +108,10 @@ impl ShellOutput {
 /// The codex binary to run and, if it needs one, the PATH to run it with.
 struct CodexBin {
     path: std::path::PathBuf,
-    /// Set when codex came from the login shell: our PATH lacks its directory,
-    /// and an npm shim there (`#!/usr/bin/env node`) needs the node that
-    /// nvm/volta/fnm install next to it.
+    /// Set when codex came from the login shell, whose PATH ours lacks: that
+    /// PATH, so an npm shim (`#!/usr/bin/env node`) finds node wherever the
+    /// login config put it, even in another directory than the shim. Without
+    /// the login PATH, codex's directory in front of ours.
     child_path: Option<std::ffi::OsString>,
 }
 
@@ -132,16 +136,20 @@ fn has_exited(child: &Child) -> std::io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-/// The last SHELL_OUTPUT_CAP bytes of stdout of `shell -lc "command -v
-/// codex"`, or None if the shell could not be started. Returns by
+/// The last SHELL_OUTPUT_CAP bytes of stdout of `shell -lc`, printing
+/// LOGIN_MARKER, the exported PATH (an empty line if unset) and `command -v
+/// codex`, or None if the shell could not be started. Returns by
 /// `shell_deadline`, apart from reaping a killed shell. Background jobs of the
 /// login config that still hold stdout once the shell has exited (or the shell
 /// itself, at the deadline) are killed with the shell's process group. Holders
 /// outside that group (setsid) can't be reached, but the read end is closed on
 /// return, so nothing outlives the call: their later writes get EPIPE.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
+    // printenv joins PATH with colons in any shell (fish's "$PATH" uses
+    // spaces); `|| echo` keeps the PATH line when PATH is unset.
+    let lookup = format!("printf '%s\\n' '{LOGIN_MARKER}'; printenv PATH || echo; command -v codex");
     let mut child = Command::new(shell)
-        .args(["-lc", "command -v codex"])
+        .args(["-lc", &lookup])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -221,15 +229,27 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
 }
 
-/// The last absolute, executable path in the login shell's `stdout`, to be run
-/// with its directory in front of `current` (our PATH, which lacks it).
+/// Codex as found by login_shell_lookup: what follows the last LOGIN_MARKER
+/// line is the login PATH, then the lookup's answer; without a marker, the
+/// whole output is the answer. Codex is the answer's last absolute, executable
+/// path, to be run with the login PATH or, if that is missing or empty, with
+/// its directory in front of `current` (our PATH, which lacks it).
 fn codex_from_login_output(stdout: &[u8], current: Option<std::ffi::OsString>) -> Option<CodexBin> {
-    let path = String::from_utf8_lossy(stdout)
-        .lines()
+    use std::os::unix::ffi::OsStrExt;
+    let lines: Vec<&[u8]> = stdout.split(|&b| b == b'\n').collect();
+    let (login_path, answer) = match lines.iter().rposition(|line| line.trim_ascii() == LOGIN_MARKER.as_bytes()) {
+        Some(i) => (lines.get(i + 1).filter(|p| !p.is_empty()), lines.get(i + 2..).unwrap_or_default()),
+        None => (None, &lines[..]),
+    };
+    let path = answer
+        .iter()
         .rev()
-        .map(|line| std::path::PathBuf::from(line.trim()))
+        .map(|line| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(line.trim_ascii())))
         .find(|p| p.is_absolute() && is_exe(p))?;
-    let child_path = path.parent().map(|dir| path_with(dir, current));
+    let child_path = match login_path {
+        Some(login_path) => Some(std::ffi::OsStr::from_bytes(login_path).to_owned()),
+        None => path.parent().map(|dir| path_with(dir, current)),
+    };
     Some(CodexBin { path, child_path })
 }
 
@@ -306,6 +326,17 @@ fn rpc_error(err: &serde_json::Value) -> ProbeError {
     }
 }
 
+/// The result of a JSON-RPC response, or its error. A response with neither
+/// is a protocol failure, not an empty result.
+fn response_result(msg: &serde_json::Value) -> Result<serde_json::Value, ProbeError> {
+    if let Some(err) = msg.get("error") {
+        return Err(rpc_error(err));
+    }
+    msg.get("result")
+        .cloned()
+        .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "codex app-server sent a response without a result"))
+}
+
 /// Stop the child and anything it started (the npm shim runs node, which runs
 /// codex). The child was spawned in its own process group, so kill the group:
 /// SIGTERM, up to 1 s for the child to exit, then SIGKILL for whatever of the
@@ -380,10 +411,7 @@ impl Rpc {
             if msg.get("id").and_then(|i| i.as_i64()) != Some(request_id) {
                 continue;
             }
-            if let Some(err) = msg.get("error") {
-                return Err(rpc_error(err));
-            }
-            return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
+            return response_result(&msg);
         }
     }
 }
@@ -391,10 +419,11 @@ impl Rpc {
 fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
     let limits = result.get("rateLimits");
     let Some(limits) = limits.filter(|l| l.is_object()) else {
-        return Err(ProbeError::new(ErrorCode::NotSignedIn, "no rate limits for this account"));
+        // The schema requires the object; a signed-out account gets an RPC error.
+        return Err(ProbeError::new(ErrorCode::Failed, "response has no rate limits object"));
     };
     let mut windows = Vec::new();
-    // A window was sent but can't be shown: a format change, not a sign-in problem.
+    // A window was sent but can't be shown: a format change, not a lack of quota.
     let mut unrecognized = false;
     for slot in ["primary", "secondary"] {
         let Some(w) = limits.get(slot).filter(|w| !w.is_null()) else { continue };
@@ -416,7 +445,7 @@ fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
         return Err(if unrecognized {
             ProbeError::new(ErrorCode::Failed, "usage windows in an unrecognized format")
         } else {
-            ProbeError::new(ErrorCode::NotSignedIn, "no usage windows for this account")
+            ProbeError::new(ErrorCode::NoQuota, "no usage windows for this account")
         });
     }
     // Order: short window first.
@@ -484,11 +513,13 @@ mod tests {
             self.script("shell", &format!("#!/bin/sh\n{body}\n"))
         }
 
-        /// Write `contents` as executable file `name` and return its path.
+        /// Write `contents` as executable file `name` (relative, its parent
+        /// dirs created) and return its path.
         fn script(&self, name: &str, contents: &str) -> std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let _writing = SCRIPTS.write().unwrap_or_else(|e| e.into_inner());
             let path = self.path(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, contents).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
@@ -687,6 +718,94 @@ mod tests {
     }
 
     #[test]
+    fn npm_shim_finds_node_in_another_dir_through_the_login_path() {
+        let scratch = Scratch::new("shimsplit");
+        // An npm global prefix apart from node's own bin dir.
+        let shim = scratch.script("npmg/codex", "#!/usr/bin/env fakenode\n");
+        scratch.script("node/fakenode", "#!/bin/sh\necho ran-by-fakenode\n");
+        let (npmg, node) = (scratch.path("npmg"), scratch.path("node"));
+        // A login config that puts both on PATH. It runs the command with a
+        // plain `sh -c`: `sh -l` would source this host's real profile.
+        let shell = scratch.shell(&format!(
+            "PATH={}:{}:/usr/bin:/bin; export PATH\nexec /bin/sh -c \"$2\"",
+            npmg.display(),
+            node.display()
+        ));
+        let (out, _) = lookup(&shell, Duration::from_secs(5));
+        let found = codex_from_login_output(&out.unwrap(), Some("/usr/bin:/bin".into())).unwrap();
+        assert_eq!(found.path, shim);
+        let child_path = found.child_path.unwrap();
+        assert_eq!(child_path, format!("{}:{}:/usr/bin:/bin", npmg.display(), node.display()).as_str());
+        assert_eq!(run_with_path(&shim, &child_path).as_deref(), Some("ran-by-fakenode\n"));
+        // The shim's dir in front of our PATH is not enough in this layout.
+        assert_eq!(run_with_path(&shim, &path_with(&npmg, Some("/usr/bin:/bin".into()))), None);
+    }
+
+    #[test]
+    fn login_output_after_marker_runs_codex_with_the_login_path() {
+        let scratch = Scratch::new("loginmarker");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        let stdout = format!("welcome!\n{LOGIN_MARKER}\n/a/bin:/b/bin\n{}\n", codex.display());
+        let found = codex_from_login_output(stdout.as_bytes(), Some("/usr/bin".into())).unwrap();
+        assert_eq!(found.path, codex);
+        assert_eq!(found.child_path.unwrap(), "/a/bin:/b/bin");
+    }
+
+    #[test]
+    fn login_output_uses_only_what_follows_the_last_marker() {
+        let scratch = Scratch::new("loginlast");
+        let old = scratch.script("old/codex", "#!/bin/sh\n");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        // Login-config noise that looks like our own output comes first.
+        let stdout =
+            format!("{LOGIN_MARKER}\n/noise/bin\n{}\n{LOGIN_MARKER}\n/login/bin\n{}\n", old.display(), codex.display());
+        let found = codex_from_login_output(stdout.as_bytes(), None).unwrap();
+        assert_eq!(found.path, codex);
+        assert_eq!(found.child_path.unwrap(), "/login/bin");
+    }
+
+    #[test]
+    fn login_output_with_empty_path_puts_codex_dir_first() {
+        let scratch = Scratch::new("loginempty");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        let stdout = format!("{LOGIN_MARKER}\n\n{}\n", codex.display());
+        let found = codex_from_login_output(stdout.as_bytes(), Some("/usr/bin".into())).unwrap();
+        assert_eq!(found.path, codex);
+        assert_eq!(found.child_path.unwrap(), format!("{}:/usr/bin", scratch.0.display()).as_str());
+    }
+
+    #[test]
+    fn login_output_with_marker_but_no_codex_gives_none() {
+        let scratch = Scratch::new("loginnocodex");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        // An executable printed before the marker is login-config noise.
+        let stdout = format!("{}\n{LOGIN_MARKER}\n/usr/bin:/bin\n", codex.display());
+        assert!(codex_from_login_output(stdout.as_bytes(), None).is_none());
+        assert!(codex_from_login_output(format!("{LOGIN_MARKER}\n").as_bytes(), None).is_none());
+    }
+
+    #[test]
+    fn response_without_result_is_failed() {
+        let e = response_result(&serde_json::json!({"id": 1})).err().unwrap();
+        assert_eq!(e.code, ErrorCode::Failed);
+        let ok = response_result(&serde_json::json!({"id": 1, "result": {"rateLimits": {}}})).unwrap();
+        assert_eq!(ok, serde_json::json!({"rateLimits": {}}));
+        let e = response_result(&serde_json::json!({"id": 1, "error": {"message": "Not logged in"}})).err().unwrap();
+        assert_eq!(e.code, ErrorCode::NotSignedIn);
+    }
+
+    #[test]
+    fn rpc_error_reads_codex_sign_in_errors_as_not_signed_in() {
+        for message in [
+            "codex account authentication required to read rate limits",
+            "chatgpt authentication required to read rate limits",
+        ] {
+            let e = rpc_error(&serde_json::json!({"code": -32600, "message": message}));
+            assert_eq!(e.code, ErrorCode::NotSignedIn, "{message}");
+        }
+    }
+
+    #[test]
     fn rpc_error_classifies_the_message() {
         let e = rpc_error(&serde_json::json!({"code": -32600, "message": "Not logged in"}));
         assert_eq!((e.code, e.detail.as_str()), (ErrorCode::NotSignedIn, "Not logged in"));
@@ -829,14 +948,25 @@ mod tests {
     }
 
     #[test]
-    fn normalize_without_windows_is_not_signed_in() {
+    fn normalize_without_rate_limits_object_is_failed() {
         for result in [
             serde_json::json!({}),
+            serde_json::json!(null),
             serde_json::json!({"rateLimits": null}),
+            serde_json::json!({"rateLimits": []}),
+            serde_json::json!({"rateLimits": "x"}),
+        ] {
+            assert_eq!(normalize(&result).err().unwrap().code, ErrorCode::Failed, "{result}");
+        }
+    }
+
+    #[test]
+    fn normalize_without_windows_is_no_quota() {
+        for result in [
             serde_json::json!({"rateLimits": {}}),
             serde_json::json!({"rateLimits": {"primary": null, "secondary": null}}),
         ] {
-            assert_eq!(normalize(&result).err().unwrap().code, ErrorCode::NotSignedIn, "{result}");
+            assert_eq!(normalize(&result).err().unwrap().code, ErrorCode::NoQuota, "{result}");
         }
     }
 

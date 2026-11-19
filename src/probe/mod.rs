@@ -35,7 +35,8 @@ pub enum ErrorCode {
     NotSignedIn,
     /// Tool is not installed (codex binary missing).
     Missing,
-    /// Account uses non-quota billing (devin).
+    /// Account has no quota windows: non-quota billing (devin) or no usage
+    /// windows (codex).
     NoQuota,
     Timeout,
     /// Claude only: no capture file yet — Claude Code hasn't run here.
