@@ -1,0 +1,18 @@
+[package]
+name = "limits-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+dirs = "7.0.0"
+libc = "0.2.191"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+toml = "1.2.1"
+ureq = "3.5.2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
