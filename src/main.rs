@@ -12,6 +12,9 @@ const CLAUDE_POLL: Duration = Duration::from_secs(15);
 /// Codex/Devin spawn a process or hit the network — poll like the mods do.
 const PROBE_POLL: Duration = Duration::from_secs(5 * 60);
 const PROBE_RETRY: Duration = Duration::from_secs(60);
+/// A running probe answers through a channel that `event::poll` can't watch,
+/// so check it this often until the probe is done.
+const PROBE_CHECK: Duration = Duration::from_millis(100);
 /// Refetch just after a reset passes so the new window shows up promptly.
 const AFTER_RESET: i64 = 15;
 /// Claude data older than this renders dimmed.
@@ -147,6 +150,16 @@ fn next_wakeup(app: &App) -> Option<Instant> {
     [&app.claude, &app.codex, &app.devin].into_iter().filter(|s| !s.busy).map(|s| s.next_at).min()
 }
 
+/// How long to wait for a key: until the next due fetch, but at most 1 s (for
+/// the countdown text), or PROBE_CHECK while a probe runs; at least 10 ms.
+fn poll_wait(app: &App, now: Instant) -> Duration {
+    let cap = if app.codex.busy || app.devin.busy { PROBE_CHECK } else { Duration::from_secs(1) };
+    next_wakeup(app)
+        .map_or(Duration::MAX, |at| at.saturating_duration_since(now))
+        .min(cap)
+        .max(Duration::from_millis(10))
+}
+
 /// One non-interactive snapshot for `--once` / unscripted checks (and for
 /// terminals that can't host a TUI). Prints one line per source.
 fn run_once() {
@@ -217,12 +230,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
 
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        // Wake at 1s cadence for countdown text, or sooner for a due fetch.
-        let wait = next_wakeup(&app)
-            .map_or(Duration::MAX, |at| at.saturating_duration_since(Instant::now()))
-            .min(Duration::from_secs(1))
-            .max(Duration::from_millis(10));
-        if !event::poll(wait)? {
+        if !event::poll(poll_wait(&app, Instant::now()))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -277,6 +285,40 @@ mod tests {
             s.busy = true;
         }
         assert_eq!(next_wakeup(&app), None);
+    }
+
+    #[test]
+    fn poll_wait_checks_often_while_a_probe_runs() {
+        let mut app = app();
+        let now = Instant::now();
+        app.claude.next_at = now + Duration::from_secs(15);
+        app.devin.next_at = now + Duration::from_secs(300);
+        app.codex.next_at = now - Duration::from_secs(1);
+        app.codex.busy = true;
+        assert_eq!(poll_wait(&app, now), PROBE_CHECK);
+    }
+
+    #[test]
+    fn poll_wait_is_one_second_when_idle() {
+        let mut app = app();
+        let now = Instant::now();
+        for s in [&mut app.claude, &mut app.codex, &mut app.devin] {
+            s.next_at = now + Duration::from_secs(60);
+        }
+        assert_eq!(poll_wait(&app, now), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn poll_wait_is_short_for_a_due_fetch_but_never_zero() {
+        let mut app = app();
+        let now = Instant::now();
+        for s in [&mut app.claude, &mut app.codex, &mut app.devin] {
+            s.next_at = now + Duration::from_secs(60);
+        }
+        app.claude.next_at = now + Duration::from_millis(40);
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(40));
+        app.claude.next_at = now - Duration::from_secs(1);
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(10));
     }
 
     fn ok(plan: Option<&str>, overage_micros: Option<i64>) -> ProbeResult {

@@ -212,35 +212,73 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(shell) = std::env::var("SHELL") {
         // The login shell may source slow config; bound it like the Python probe.
         let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
-        if let Some(stdout) = login_shell_lookup(shell.as_ref(), shell_deadline) {
-            for line in String::from_utf8_lossy(&stdout).lines().rev() {
-                let p = std::path::PathBuf::from(line.trim());
-                if p.is_absolute() && is_exe(&p) {
-                    let child_path = p.parent().map(|dir| path_with(dir, std::env::var_os("PATH")));
-                    return Ok(CodexBin { path: p, child_path });
-                }
-            }
+        if let Some(stdout) = login_shell_lookup(shell.as_ref(), shell_deadline)
+            && let Some(codex) = codex_from_login_output(&stdout, std::env::var_os("PATH"))
+        {
+            return Ok(codex);
         }
     }
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
 }
 
+/// The last absolute, executable path in the login shell's `stdout`, to be run
+/// with its directory in front of `current` (our PATH, which lacks it).
+fn codex_from_login_output(stdout: &[u8], current: Option<std::ffi::OsString>) -> Option<CodexBin> {
+    let path = String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .map(|line| std::path::PathBuf::from(line.trim()))
+        .find(|p| p.is_absolute() && is_exe(p))?;
+    let child_path = path.parent().map(|dir| path_with(dir, current));
+    Some(CodexBin { path, child_path })
+}
+
+/// `codex app-server` with piped stdio, in its own process group so kill_tree
+/// can take down npm-shim children.
+fn app_server_command(codex: &CodexBin) -> Command {
+    let mut command = Command::new(&codex.path);
+    command.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
+    if let Some(path) = &codex.child_path {
+        command.env("PATH", path);
+    }
+    command
+}
+
+/// Lowercase words of `text`, split at non-alphanumerics and, with `camel`,
+/// also where a lowercase letter or digit meets an uppercase one
+/// ("NotLoggedIn" -> not, logged, in).
+fn words(text: &str, camel: bool) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in text.chars() {
+        if (!c.is_alphanumeric() || (camel && prev_lower && c.is_uppercase())) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// auth, authentication, unauthorized, reauthenticate, authorization...
+/// but not author, authored, authority.
+fn is_auth_word(word: &str) -> bool {
+    let w = word.strip_prefix("un").or_else(|| word.strip_prefix("re")).unwrap_or(word);
+    w.starts_with("auth") && (!w.starts_with("author") || w.starts_with("authoriz") || w.starts_with("authoris"))
+}
+
 /// Errors whose message hints the account isn't signed in. Matches whole
-/// words, so "assign", "author" or "4012" don't count.
+/// words, so "assign", "author" or "4012" don't count. Words are taken both
+/// as written and split at camelCase, so "ChatGPT account" and "NotLoggedIn"
+/// both match.
 fn auth_hint(text: &str) -> bool {
-    const WORDS: &[&str] = &[
-        "auth",
-        "authenticate",
-        "authenticated",
-        "authentication",
-        "unauthenticated",
-        "unauthorized",
-        "unauthorised",
-        "oauth",
-        "login",
-        "signin",
-        "401",
-    ];
+    const WORDS: &[&str] = &["oauth", "login", "signin", "401"];
     const PHRASES: &[&[&str]] = &[
         &["log", "in"],
         &["logged", "in"],
@@ -251,15 +289,30 @@ fn auth_hint(text: &str) -> bool {
         &["api", "key"],
         &["chatgpt", "account"],
     ];
-    let t = text.to_lowercase();
-    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    words.iter().any(|w| WORDS.contains(w)) || PHRASES.iter().any(|p| words.windows(p.len()).any(|w| w == *p))
+    [false, true].into_iter().any(|camel| {
+        let words = words(text, camel);
+        words.iter().any(|w| WORDS.contains(&w.as_str()) || is_auth_word(w))
+            || PHRASES.iter().any(|p| words.windows(p.len()).any(|w| w.iter().zip(p.iter()).all(|(a, b)| a == b)))
+    })
+}
+
+/// A JSON-RPC error response as a ProbeError. Only the server's message is
+/// classified: without one, the serialized object (keys like "authMode")
+/// would say nothing about sign-in, so it is just the detail.
+fn rpc_error(err: &serde_json::Value) -> ProbeError {
+    match err.get("message").and_then(|m| m.as_str()) {
+        Some(text) => ProbeError::new(if auth_hint(text) { ErrorCode::NotSignedIn } else { ErrorCode::Failed }, text),
+        None => ProbeError::new(ErrorCode::Failed, err.to_string()),
+    }
 }
 
 /// Stop the child and anything it started (the npm shim runs node, which runs
 /// codex). The child was spawned in its own process group, so kill the group:
 /// SIGTERM, up to 1 s for the child to exit, then SIGKILL for whatever of the
 /// group is left, which would otherwise keep stdout open and block the reader.
+/// The rest of the group gets no grace of its own past the child's exit: the
+/// npm shim exits after codex does, and a probe that waited out the full
+/// second on every poll would gain nothing for a read-only call.
 fn kill_tree(child: &mut Child) {
     drop(child.stdin.take());
     let pgid = child.id() as libc::pid_t;
@@ -328,10 +381,7 @@ impl Rpc {
                 continue;
             }
             if let Some(err) = msg.get("error") {
-                let text =
-                    err.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| err.to_string());
-                let code = if auth_hint(&text) { ErrorCode::NotSignedIn } else { ErrorCode::Failed };
-                return Err(ProbeError::new(code, text));
+                return Err(rpc_error(err));
             }
             return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
         }
@@ -383,13 +433,9 @@ pub fn fetch() -> ProbeResult {
     let deadline = Instant::now() + timeout_from_env("CODEX_LIMITS_TIMEOUT", DEFAULT_TIMEOUT_SECS);
 
     let codex = find_codex(deadline)?;
-    let mut command = Command::new(&codex.path);
-    command.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0); // own group so kill_tree can take down npm-shim children
-    if let Some(path) = &codex.child_path {
-        command.env("PATH", path);
-    }
-    let mut child =
-        command.spawn().map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
+    let mut child = app_server_command(&codex)
+        .spawn()
+        .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
 
     let result = (|| {
         let mut rpc = Rpc::spawn(&mut child, deadline)?;
@@ -640,6 +686,59 @@ mod tests {
         assert_eq!(run_with_path(&shim, &path).as_deref(), Some("ran-by-fakenode\n"));
     }
 
+    #[test]
+    fn rpc_error_classifies_the_message() {
+        let e = rpc_error(&serde_json::json!({"code": -32600, "message": "Not logged in"}));
+        assert_eq!((e.code, e.detail.as_str()), (ErrorCode::NotSignedIn, "Not logged in"));
+        let e = rpc_error(&serde_json::json!({"code": -32603, "message": "failed to assign thread"}));
+        assert_eq!(e.code, ErrorCode::Failed);
+    }
+
+    #[test]
+    fn rpc_error_without_message_is_failed_whatever_its_keys() {
+        let err = serde_json::json!({"code": -32603, "data": {"authMode": "chatgpt"}});
+        let e = rpc_error(&err);
+        assert_eq!(e.code, ErrorCode::Failed);
+        assert_eq!(e.detail, err.to_string());
+    }
+
+    #[test]
+    fn login_output_gives_last_executable_path_with_its_dir_on_path() {
+        let scratch = Scratch::new("loginout");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        let stdout = format!("welcome!\n{}\nrelative/codex\n/nonexistent/codex\n", codex.display());
+        let found = codex_from_login_output(stdout.as_bytes(), Some("/usr/bin".into())).unwrap();
+        assert_eq!(found.path, codex);
+        assert_eq!(found.child_path.unwrap(), format!("{}:/usr/bin", scratch.0.display()).as_str());
+    }
+
+    #[test]
+    fn login_output_without_an_executable_path_gives_none() {
+        let scratch = Scratch::new("loginnone");
+        let not_exe = scratch.path("codex");
+        std::fs::write(&not_exe, "").unwrap();
+        let stdout = format!("{}\nrelative/codex\n/nonexistent/codex\n", not_exe.display());
+        assert!(codex_from_login_output(stdout.as_bytes(), None).is_none());
+        assert!(codex_from_login_output(b"", None).is_none());
+    }
+
+    #[test]
+    fn app_server_command_sets_path_only_when_needed() {
+        let path_env = |codex: &CodexBin| {
+            app_server_command(codex)
+                .get_envs()
+                .find(|(k, _)| *k == "PATH")
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        let plain = CodexBin { path: "/usr/bin/codex".into(), child_path: None };
+        assert_eq!(path_env(&plain), None);
+        let shell = CodexBin { path: "/n/bin/codex".into(), child_path: Some("/n/bin:/usr/bin".into()) };
+        assert_eq!(path_env(&shell), Some(Some("/n/bin:/usr/bin".into())));
+        let cmd = app_server_command(&shell);
+        assert_eq!(cmd.get_program(), "/n/bin/codex");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["app-server"]);
+    }
+
     // --- kill_tree ---
 
     fn spawn_group(script: &str) -> Child {
@@ -670,13 +769,16 @@ mod tests {
 
     #[test]
     fn kill_tree_kills_a_leader_that_ignores_sigterm() {
-        let mut child = spawn_group("trap '' TERM\nsleep 30");
-        // Let the shell install its trap first.
-        std::thread::sleep(Duration::from_millis(200));
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = Scratch::new("killleader");
+        let ready = scratch.path("ready");
+        let mut child = spawn_group(&format!("trap '' TERM\ntouch {}\nsleep 30", ready.display()));
+        assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
         let start = Instant::now();
         kill_tree(&mut child);
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
-        assert!(child.try_wait().unwrap().is_some());
+        // SIGTERM was ignored, so only the SIGKILL can have ended it.
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 
     #[test]
@@ -752,6 +854,12 @@ mod tests {
             "unauthorised",
             "auth token expired",
             "OAuth refresh token was rejected: invalid_grant",
+            "Authorization failed",
+            "not authorized",
+            "please reauthenticate",
+            "AuthRequired",
+            "NotLoggedIn",
+            "ChatGPT account required",
             "Authentication failed",
             "missing API key",
             "no ChatGPT account",
@@ -772,7 +880,10 @@ mod tests {
             "request id 74012",
             "port 4010 refused",
             "log rotated in /var/log",
-            "{\"code\":-32603,\"data\":{\"authMode\":\"chatgpt\"}}",
+            "certificate authority unknown",
+            "authored by codex",
+            "AuthorName missing",
+            "Catalog index in progress",
         ] {
             assert!(!auth_hint(msg), "{msg}");
         }
