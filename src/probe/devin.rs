@@ -42,6 +42,15 @@ fn load_credentials() -> Result<Credentials, ProbeError> {
     Ok(Credentials { api_key, api_server_url })
 }
 
+/// The GetUserStatus endpoint on the configured server. The request carries
+/// the API key, so only https is allowed.
+fn status_url(api_server_url: &str) -> Result<String, ProbeError> {
+    if !api_server_url.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return Err(ProbeError::new(ErrorCode::Failed, "API server URL must use https"));
+    }
+    Ok(format!("{}{}", api_server_url.trim_end_matches('/'), STATUS_PATH))
+}
+
 /// Server-provided detail, or a fallback; the API key is always redacted.
 fn server_detail(body: &str, fallback: &str, key: &str) -> String {
     let mut detail = fallback.to_string();
@@ -73,7 +82,7 @@ pub fn fetch() -> ProbeResult {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
 
     let creds = load_credentials()?;
-    let url = format!("{}{}", creds.api_server_url.trim_end_matches('/'), STATUS_PATH);
+    let url = status_url(&creds.api_server_url)?;
     let body = serde_json::json!({
         "metadata": {
             "apiKey": creds.api_key,
@@ -87,6 +96,7 @@ pub fn fetch() -> ProbeResult {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(deadline - Instant::now()))
         .http_status_as_error(false) // read the body ourselves, like the Python probe
+        .https_only(true) // also refuse redirects to plain http
         .build()
         .into();
     let mut response = agent
@@ -97,10 +107,7 @@ pub fn fetch() -> ProbeResult {
         .map_err(map_error)?;
 
     let status = response.status().as_u16();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| ProbeError::new(ErrorCode::Failed, e.to_string()))?;
+    let text = response.body_mut().read_to_string().map_err(|e| ProbeError::new(ErrorCode::Failed, e.to_string()))?;
 
     if Instant::now() > deadline {
         return Err(ProbeError::new(ErrorCode::Timeout, "request timed out"));
@@ -117,8 +124,8 @@ pub fn fetch() -> ProbeResult {
             server_detail(&text, &format!("HTTP {status}"), &creds.api_key),
         ));
     }
-    let payload: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| ProbeError::new(ErrorCode::Failed, "API response is not valid JSON"))?;
+    let payload: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| ProbeError::new(ErrorCode::Failed, "API response is not valid JSON"))?;
     normalize(&payload, &creds.api_key)
 }
 
@@ -151,9 +158,13 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         match plan_info.get(hidden_field) {
             None | Some(serde_json::Value::Bool(false)) => {}
             Some(serde_json::Value::Bool(true)) => continue,
-            _ => return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid quota visibility flag")),
+            _ => {
+                return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid quota visibility flag"));
+            }
         }
-        let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else { continue };
+        let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else {
+            continue;
+        };
         let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0);
         let used = (100 - remaining).clamp(0, 100) as f64;
         windows.push(UsageWindow { label, used_percent: used, resets_at: reset });
@@ -167,7 +178,61 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
     let plan = match plan_info.get("planName") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(s.clone()),
-        _ => return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid plan name")),
+        _ => {
+            return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid plan name"));
+        }
     };
     Ok(FetchOk { windows, plan, overage_micros: Some(overage), fetched_at: unix_now() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_url_accepts_https() {
+        assert_eq!(
+            status_url("https://server.codeium.com").unwrap(),
+            format!("https://server.codeium.com{STATUS_PATH}")
+        );
+    }
+
+    #[test]
+    fn status_url_accepts_uppercase_scheme() {
+        assert_eq!(status_url("HTTPS://example.com").unwrap(), format!("HTTPS://example.com{STATUS_PATH}"));
+    }
+
+    #[test]
+    fn status_url_trims_trailing_slashes() {
+        assert_eq!(status_url("https://example.com//").unwrap(), format!("https://example.com{STATUS_PATH}"));
+    }
+
+    #[test]
+    fn status_url_rejects_plain_http() {
+        let err = status_url("http://example.com").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.detail.contains("https"), "detail: {}", err.detail);
+    }
+
+    #[test]
+    fn status_url_rejects_uppercase_plain_http() {
+        assert!(status_url("HTTP://example.com").is_err());
+    }
+
+    #[test]
+    fn status_url_rejects_missing_scheme() {
+        assert!(status_url("server.codeium.com").is_err());
+    }
+
+    #[test]
+    fn status_url_rejects_short_and_empty() {
+        assert!(status_url("").is_err());
+        assert!(status_url("https:/").is_err());
+    }
+
+    #[test]
+    fn status_url_rejects_other_schemes_starting_with_https() {
+        assert!(status_url("https+unix://example.com").is_err());
+        assert!(status_url("httpsx://example.com").is_err());
+    }
 }
