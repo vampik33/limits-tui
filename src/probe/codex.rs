@@ -8,22 +8,46 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, unix_now};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
+/// Most bytes of login-shell output kept; the rest is ignored.
+const SHELL_OUTPUT_CAP: u64 = 64 * 1024;
+/// How long the login shell's stdout may stay open after the shell exits
+/// before the background jobs it left holding it are killed.
+const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
 
 fn is_exe(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
-/// Stdout of `shell -lc "command -v codex"`, or None if the shell could not
-/// be started or printed nothing readable. Returns by `shell_deadline` even
-/// when a background job of the login config keeps stdout open: the shell's
-/// process group is then killed and what was printed so far is returned.
+/// Whether `child` has exited, without reaping it: its pid stays reserved, so
+/// it is still safe to signal as a process group id.
+fn has_exited(child: &Child) -> std::io::Result<bool> {
+    // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves the child
+    // to be reaped by `Child::wait`.
+    let rc = unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: waitid succeeded; with WNOHANG, si_pid stays 0 until the child
+    // has exited.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Stdout of `shell -lc "command -v codex"` (at most SHELL_OUTPUT_CAP bytes),
+/// or None if the shell could not be started. Returns by `shell_deadline`,
+/// apart from reaping a killed shell. Background jobs of the login config
+/// that still hold stdout once the shell has exited (or the shell itself, at
+/// the deadline) are killed with the shell's process group. Holders outside
+/// that group (setsid) can't be reached: the output printed so far is
+/// returned and the reader thread lives until they release stdout.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     let mut child = Command::new(shell)
         .args(["-lc", "command -v codex"])
@@ -33,34 +57,50 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
         .process_group(0) // a non-interactive shell keeps its background jobs in this group
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let (tx, rx) = mpsc::channel();
+    let mut stdout = child.stdout.take().expect("stdout is piped").take(SHELL_OUTPUT_CAP);
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let (closed_tx, closed_rx) = mpsc::channel::<()>();
+    let sink = Arc::clone(&output);
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let out = rx.recv_timeout(shell_deadline.saturating_duration_since(Instant::now())).ok();
-    let exited = out.is_some()
-        && loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break true,
-                Ok(None) if Instant::now() < shell_deadline => std::thread::sleep(Duration::from_millis(25)),
-                _ => break false,
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
-        };
-    if exited {
-        return out;
-    }
-    // SAFETY: killpg only sends a signal. The group id is the pid of our
-    // child, which leads the group created by process_group(0); the child is
-    // not reaped yet, so the id cannot have been reused.
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = closed_tx.send(());
+    });
+    let until = |t: Instant| t.saturating_duration_since(Instant::now());
+
+    // Wait for the shell itself, not for stdout to close.
+    let exited = loop {
+        match has_exited(&child) {
+            Ok(true) => break true,
+            Ok(false) if Instant::now() < shell_deadline => {
+                std::thread::sleep(until(shell_deadline).min(Duration::from_millis(25)));
+            }
+            _ => break false,
+        }
+    };
+    // Let stdout drain and close; something still holding it gets killed.
+    let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
+    let closed = exited && closed_rx.recv_timeout(until(grace_end)).is_ok();
+    if !closed {
+        // SAFETY: killpg only sends a signal. The group id is the pid of our
+        // child, which leads the group created by process_group(0); the child
+        // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
+        // been reused.
+        unsafe {
+            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        // Killed holders release stdout at once; give the reader a moment.
+        let _ = closed_rx.recv_timeout(until((Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline)));
     }
     let _ = child.wait();
-    out.or_else(|| rx.recv_timeout(Duration::from_millis(100)).ok())
+    Some(std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
@@ -255,17 +295,36 @@ mod tests {
     /// hold it shared, so no fork overlaps an open script.
     static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-    /// Write `body` as an executable `/bin/sh` script in a per-test temp dir
-    /// and return its path; the fake "login shell" ignores its arguments.
-    fn fake_shell(test: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let _writing = SCRIPTS.write().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("shell");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    /// Per-test temp dir, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+
+        /// Write `body` as an executable `/bin/sh` script and return its path;
+        /// the fake "login shell" ignores its arguments.
+        fn shell(&self, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let _writing = SCRIPTS.write().unwrap_or_else(|e| e.into_inner());
+            let path = self.path("shell");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn lookup(shell: &std::path::Path, budget: Duration) -> (Option<Vec<u8>>, Duration) {
@@ -275,56 +334,91 @@ mod tests {
         (out, start.elapsed())
     }
 
-    #[test]
-    fn plain_shell_returns_its_output() {
-        let shell = fake_shell("plain", "echo /bin/sh");
-        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
-        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    fn read_pid(path: &std::path::Path) -> libc::pid_t {
+        std::fs::read_to_string(path).unwrap().trim().parse().unwrap()
     }
 
-    #[test]
-    fn background_job_holding_stdout_does_not_outlive_deadline() {
-        let shell = fake_shell("bg", "sleep 30 &\necho /bin/sh");
-        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
-        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
-        // The path printed before the deadline is still used.
-        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
-    }
-
-    #[test]
-    fn background_job_holding_stdout_is_killed() {
-        let dir = std::env::temp_dir().join(format!("limits-tui-{}-bgkill", std::process::id()));
-        let pidfile = dir.join("pid");
-        let shell = fake_shell("bgkill", &format!("sleep 30 &\necho $! > {}\necho /bin/sh", pidfile.display()));
-        let (_, elapsed) = lookup(&shell, Duration::from_secs(1));
-        // Without the bound, a lookup that waits out the job would pass too.
-        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
-        let pid = std::fs::read_to_string(&pidfile).unwrap();
-        // Reparented to init after the kill; allow a moment to be reaped.
-        let stat = std::path::PathBuf::from(format!("/proc/{}/stat", pid.trim()));
-        let gone = (0..40).any(|_| {
+    /// Whether `pid` is gone (or a zombie awaiting init) within about 2s.
+    fn is_gone(pid: libc::pid_t) -> bool {
+        let stat = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+        (0..40).any(|_| {
             let alive = std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z "));
             if alive {
                 std::thread::sleep(Duration::from_millis(50));
             }
             !alive
-        });
-        assert!(gone, "background sleep {} is still running", pid.trim());
+        })
+    }
+
+    #[test]
+    fn plain_shell_returns_its_output() {
+        let scratch = Scratch::new("plain");
+        let (out, elapsed) = lookup(&scratch.shell("echo /bin/sh"), Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn background_job_holding_stdout_does_not_delay_lookup() {
+        let scratch = Scratch::new("bg");
+        let (out, elapsed) = lookup(&scratch.shell("sleep 30 &\necho /bin/sh"), Duration::from_secs(5));
+        // The shell exits at once; waiting for the job to release stdout
+        // would take the whole budget.
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+    }
+
+    #[test]
+    fn background_job_holding_stdout_is_killed() {
+        let scratch = Scratch::new("bgkill");
+        let pidfile = scratch.path("pid");
+        let shell = scratch.shell(&format!("sleep 30 &\necho $! > {}\necho /bin/sh", pidfile.display()));
+        let (_, elapsed) = lookup(&shell, Duration::from_secs(5));
+        // Without the bound, a lookup that waits out the job would pass too.
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        let pid = read_pid(&pidfile);
+        assert!(is_gone(pid), "background sleep {pid} is still running");
+    }
+
+    #[test]
+    fn holder_outside_the_process_group_keeps_the_path() {
+        let scratch = Scratch::new("setsid");
+        let pidfile = scratch.path("pid");
+        // setsid moves the job out of the shell's group, beyond killpg.
+        let shell = scratch.shell(&format!("setsid sleep 10 &\necho $! > {}\necho /bin/sh", pidfile.display()));
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        let pid = read_pid(&pidfile);
+        // SAFETY: plain signal to the test's own background sleep.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+    }
+
+    #[test]
+    fn output_is_capped() {
+        let scratch = Scratch::new("cap");
+        let shell = scratch.shell("head -c 100000 /dev/zero | tr '\\0' a\necho\necho /bin/sh");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        let out = out.unwrap();
+        assert!(!out.is_empty());
+        assert!(out.len() as u64 <= SHELL_OUTPUT_CAP, "read {} bytes", out.len());
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[test]
     fn shell_that_never_exits_is_bounded() {
-        let shell = fake_shell("hang", "sleep 30");
-        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
+        let scratch = Scratch::new("hang");
+        let (out, elapsed) = lookup(&scratch.shell("sleep 30"), Duration::from_secs(1));
         assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
         assert!(out.unwrap_or_default().is_empty());
     }
 
     #[test]
     fn shell_that_closes_stdout_but_keeps_running_is_bounded() {
-        let shell = fake_shell("closed", "exec >/dev/null\nsleep 30");
-        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
+        let scratch = Scratch::new("closed");
+        let (out, elapsed) = lookup(&scratch.shell("exec >/dev/null\nsleep 30"), Duration::from_secs(1));
         assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
         // Some (not None) shows the shell really ran and closed its stdout.
         assert_eq!(out.as_deref(), Some(&b""[..]));
@@ -332,16 +426,16 @@ mod tests {
 
     #[test]
     fn failing_shell_returns_no_path() {
-        let shell = fake_shell("fail", "exit 1");
-        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        let scratch = Scratch::new("fail");
+        let (out, elapsed) = lookup(&scratch.shell("exit 1"), Duration::from_secs(5));
         assert_eq!(out.as_deref(), Some(&b""[..]));
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[test]
     fn deadline_already_passed_returns_promptly() {
-        let shell = fake_shell("late", "sleep 30");
-        let (_, elapsed) = lookup(&shell, Duration::ZERO);
+        let scratch = Scratch::new("late");
+        let (_, elapsed) = lookup(&scratch.shell("sleep 30"), Duration::ZERO);
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
@@ -349,5 +443,15 @@ mod tests {
     fn missing_shell_returns_none() {
         let (out, _) = lookup(std::path::Path::new("/nonexistent/shell"), Duration::from_secs(1));
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn scratch_dir_is_removed() {
+        let dir = {
+            let scratch = Scratch::new("cleanup");
+            scratch.shell("true");
+            scratch.0.clone()
+        };
+        assert!(!dir.exists());
     }
 }
