@@ -254,17 +254,11 @@ mod tests {
 
     #[test]
     fn error_label_is_visible_on_a_narrow_terminal() {
-        let now = unix_now();
+        let mut last = cached(3 * 3600, 600);
+        last.windows.push(UsageWindow { label: "wk", used_percent: 63.0, resets_at: unix_now() + 4 * 86400 });
+        last.plan = Some("plus".into());
         let mut codex = SourceState::new();
-        codex.last = Some(FetchOk {
-            windows: vec![
-                UsageWindow { label: "5h", used_percent: 42.0, resets_at: now + 3 * 3600 },
-                UsageWindow { label: "wk", used_percent: 63.0, resets_at: now + 4 * 86400 },
-            ],
-            plan: Some("plus".into()),
-            overage_micros: None,
-            fetched_at: now - 600,
-        });
+        codex.last = Some(last);
         codex.error = Some(ProbeError::new(ErrorCode::NotSignedIn, "detail"));
         let app = App { claude: SourceState::new(), codex, devin: SourceState::new() };
 

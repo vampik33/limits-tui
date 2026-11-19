@@ -22,6 +22,86 @@ const SHELL_OUTPUT_CAP: usize = 64 * 1024;
 /// before the background jobs it left holding it are killed.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
 
+/// The login shell's stdout, read without blocking, and the last
+/// SHELL_OUTPUT_CAP bytes it printed.
+struct ShellOutput {
+    stdout: ChildStdout,
+    tail: Vec<u8>,
+    /// EOF or a read error; a closed stdout is no longer polled.
+    closed: bool,
+}
+
+impl ShellOutput {
+    fn new(stdout: ChildStdout) -> Self {
+        let fd = stdout.as_raw_fd();
+        // SAFETY: `fd` is the open read end owned by `stdout`; F_GETFL/F_SETFL
+        // only change its file status flags.
+        let nonblocking = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+        };
+        // A blocking read could outlast the deadline, so without O_NONBLOCK
+        // the output is not read at all.
+        Self { stdout, tail: Vec::new(), closed: !nonblocking }
+    }
+
+    /// Wait up to 25 ms, never past `deadline`, for output and read it.
+    /// Returns false once `deadline` has passed.
+    fn step(&mut self, deadline: Instant) -> bool {
+        let step = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25));
+        if step.is_zero() {
+            return false;
+        }
+        if self.closed {
+            std::thread::sleep(step);
+            return true;
+        }
+        let mut fds = libc::pollfd { fd: self.stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: `fds` is one valid pollfd for the duration of the call and
+        // its fd is owned by `self.stdout`, which outlives it. The result is
+        // not needed: POLLIN, POLLHUP, POLLERR, a timeout and EINTR are all
+        // handled by draining.
+        unsafe {
+            libc::poll(&mut fds, 1, step.as_millis() as libc::c_int);
+        }
+        self.drain();
+        true
+    }
+
+    /// Read until stdout closes or SHELL_EXIT_GRACE passes, never past
+    /// `deadline`.
+    fn settle(&mut self, deadline: Instant) {
+        let end = (Instant::now() + SHELL_EXIT_GRACE).min(deadline);
+        while !self.closed && self.step(end) {}
+    }
+
+    /// Read what stdout has for now, keeping only the last SHELL_OUTPUT_CAP
+    /// bytes.
+    fn drain(&mut self) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.tail.extend_from_slice(&chunk[..n]);
+                    let excess = self.tail.len().saturating_sub(SHELL_OUTPUT_CAP);
+                    self.tail.drain(..excess);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => break,
+            }
+        }
+        self.closed = true;
+    }
+
+    /// The output kept so far. Consuming `self` closes the read end, so a
+    /// holder outside the shell's group keeps nothing of this call alive.
+    fn into_tail(self) -> Vec<u8> {
+        self.tail
+    }
+}
+
 fn is_exe(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
@@ -43,57 +123,6 @@ fn has_exited(child: &Child) -> std::io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-/// Read what the nonblocking `stdout` has for now into `out`, keeping only
-/// its last SHELL_OUTPUT_CAP bytes. Returns whether stdout is closed (EOF or
-/// a read error).
-fn drain(stdout: &mut ChildStdout, out: &mut Vec<u8>) -> bool {
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stdout.read(&mut chunk) {
-            Ok(0) => return true,
-            Ok(n) => {
-                out.extend_from_slice(&chunk[..n]);
-                let excess = out.len().saturating_sub(SHELL_OUTPUT_CAP);
-                out.drain(..excess);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
-            Err(_) => return true,
-        }
-    }
-}
-
-/// Keep draining `stdout` into `out` until `done(closed)` holds or `deadline`
-/// passes, never blocking past it. Once stdout is closed it is no longer
-/// polled.
-fn drain_until(
-    stdout: &mut ChildStdout,
-    out: &mut Vec<u8>,
-    closed: &mut bool,
-    deadline: Instant,
-    mut done: impl FnMut(bool) -> bool,
-) {
-    while !done(*closed) {
-        let step = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25));
-        if step.is_zero() {
-            return;
-        }
-        if *closed {
-            std::thread::sleep(step);
-            continue;
-        }
-        let mut fds = libc::pollfd { fd: stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: `fds` is one valid pollfd for the duration of the call and
-        // its fd is owned by `stdout`, which outlives it. The result is not
-        // needed: POLLIN, POLLHUP, POLLERR, a timeout and EINTR are all
-        // handled by draining.
-        unsafe {
-            libc::poll(&mut fds, 1, step.as_millis() as libc::c_int);
-        }
-        *closed = drain(stdout, out);
-    }
-}
-
 /// The last SHELL_OUTPUT_CAP bytes of stdout of `shell -lc "command -v
 /// codex"`, or None if the shell could not be started. Returns by
 /// `shell_deadline`, apart from reaping a killed shell. Background jobs of the
@@ -110,36 +139,23 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
         .process_group(0) // a non-interactive shell keeps its background jobs in this group
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let fd = stdout.as_raw_fd();
-    // SAFETY: `fd` is the open read end owned by `stdout`; F_GETFL/F_SETFL
-    // only change its file status flags.
-    let nonblocking = unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
-    };
-    let mut output = Vec::new();
-    // A blocking read could outlast the deadline, so without O_NONBLOCK the
-    // output is not read at all.
-    let mut closed = !nonblocking;
+    let mut output = ShellOutput::new(child.stdout.take().expect("stdout is piped"));
 
     // (A) Wait for the shell itself, not for stdout to close; failing to
     // check on it counts as not exited.
-    let mut exited = false;
-    drain_until(&mut stdout, &mut output, &mut closed, shell_deadline, |_| match has_exited(&child) {
-        Ok(e) => {
-            exited = e;
-            e
+    let exited = loop {
+        match has_exited(&child) {
+            Ok(true) => break true,
+            Ok(false) if output.step(shell_deadline) => {}
+            _ => break false,
         }
-        Err(_) => true,
-    });
+    };
     // (B) Let stdout drain and close.
     if exited {
-        let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
-        drain_until(&mut stdout, &mut output, &mut closed, grace_end, |closed| closed);
+        output.settle(shell_deadline);
     }
     // (C) Kill the shell, or what still holds its stdout.
-    if !(exited && closed) {
+    if !(exited && output.closed) {
         // SAFETY: killpg only sends a signal. The group id is the pid of our
         // child, which leads the group created by process_group(0); the child
         // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
@@ -148,14 +164,11 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
             libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
         }
         // Killed holders release stdout at once.
-        let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
-        drain_until(&mut stdout, &mut output, &mut closed, grace_end, |closed| closed);
+        output.settle(shell_deadline);
     }
-    // Close the read end: a holder outside the group must not keep anything
-    // of this call alive.
-    drop(stdout);
+    let tail = output.into_tail();
     let _ = child.wait();
-    Some(output)
+    Some(tail)
 }
 
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
@@ -393,16 +406,21 @@ mod tests {
         std::fs::read_to_string(path).unwrap().trim().parse().unwrap()
     }
 
+    /// Whether `cond` holds within `tries` checks 50 ms apart.
+    fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
+        (0..tries).any(|_| {
+            let met = cond();
+            if !met {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            met
+        })
+    }
+
     /// Whether `pid` is gone (or a zombie awaiting init) within about 2s.
     fn is_gone(pid: libc::pid_t) -> bool {
         let stat = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
-        (0..40).any(|_| {
-            let alive = std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z "));
-            if alive {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            !alive
-        })
+        wait_until(40, || !std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z ")))
     }
 
     #[test]
@@ -482,14 +500,10 @@ mod tests {
         let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
         assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
         assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
-        let failed = (0..60).any(|_| {
-            let seen = marker.exists();
-            if !seen {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            seen
-        });
-        assert!(failed, "the holder's late write succeeded: the read end outlived the lookup");
+        assert!(
+            wait_until(60, || marker.exists()),
+            "the holder's late write succeeded: the read end outlived the lookup"
+        );
     }
 
     #[test]
