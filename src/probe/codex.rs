@@ -5,7 +5,7 @@
 //!
 //! Port of herdr-codex-limits' codex_limits.py.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -18,6 +18,49 @@ const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 fn is_exe(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+/// Stdout of `shell -lc "command -v codex"`, or None if the shell could not
+/// be started or printed nothing readable. Returns by `shell_deadline` even
+/// when a background job of the login config keeps stdout open: the shell's
+/// process group is then killed and what was printed so far is returned.
+fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
+    let mut child = Command::new(shell)
+        .args(["-lc", "command -v codex"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0) // a non-interactive shell keeps its background jobs in this group
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let out = rx.recv_timeout(shell_deadline.saturating_duration_since(Instant::now())).ok();
+    let exited = out.is_some()
+        && loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < shell_deadline => std::thread::sleep(Duration::from_millis(25)),
+                _ => break false,
+            }
+        };
+    if exited {
+        return out;
+    }
+    // SAFETY: killpg only sends a signal. The group id is the pid of our
+    // child, which leads the group created by process_group(0); the child is
+    // not reaped yet, so the id cannot have been reused.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    out.or_else(|| rx.recv_timeout(Duration::from_millis(100)).ok())
 }
 
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
@@ -38,32 +81,11 @@ fn find_codex(deadline: Instant) -> Result<std::path::PathBuf, ProbeError> {
             }
         }
     }
-    if let Ok(shell) = std::env::var("SHELL")
-        && let Ok(mut child) = Command::new(&shell)
-            .args(["-lc", "command -v codex"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-    {
+    if let Ok(shell) = std::env::var("SHELL") {
         // The login shell may source slow config; bound it like the Python probe.
         let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
-        let out = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break child.wait_with_output().ok(),
-                Ok(None) if Instant::now() < shell_deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                Err(_) => break None,
-            }
-        };
-        if let Some(out) = out {
-            for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
+        if let Some(stdout) = login_shell_lookup(shell.as_ref(), shell_deadline) {
+            for line in String::from_utf8_lossy(&stdout).lines().rev() {
                 let p = std::path::PathBuf::from(line.trim());
                 if p.is_absolute() && is_exe(&p) {
                     return Ok(p);
@@ -147,11 +169,8 @@ impl Rpc {
                 continue;
             }
             if let Some(err) = msg.get("error") {
-                let text = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| err.to_string());
+                let text =
+                    err.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| err.to_string());
                 let code = if auth_hint(&text) { ErrorCode::NotSignedIn } else { ErrorCode::Failed };
                 return Err(ProbeError::new(code, text));
             }
@@ -224,4 +243,111 @@ pub fn fetch() -> ProbeResult {
 
     kill_tree(&mut child);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child forked by one test thread inherits another thread's script
+    /// while it is still open for writing, and exec'ing that script then fails
+    /// with ETXTBSY. Script writes hold this exclusively, lookups (which fork)
+    /// hold it shared, so no fork overlaps an open script.
+    static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Write `body` as an executable `/bin/sh` script in a per-test temp dir
+    /// and return its path; the fake "login shell" ignores its arguments.
+    fn fake_shell(test: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let _writing = SCRIPTS.write().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shell");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn lookup(shell: &std::path::Path, budget: Duration) -> (Option<Vec<u8>>, Duration) {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        let out = login_shell_lookup(shell.as_os_str(), start + budget);
+        (out, start.elapsed())
+    }
+
+    #[test]
+    fn plain_shell_returns_its_output() {
+        let shell = fake_shell("plain", "echo /bin/sh");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn background_job_holding_stdout_does_not_outlive_deadline() {
+        let shell = fake_shell("bg", "sleep 30 &\necho /bin/sh");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        // The path printed before the deadline is still used.
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+    }
+
+    #[test]
+    fn background_job_holding_stdout_is_killed() {
+        let dir = std::env::temp_dir().join(format!("limits-tui-{}-bgkill", std::process::id()));
+        let pidfile = dir.join("pid");
+        let shell = fake_shell("bgkill", &format!("sleep 30 &\necho $! > {}\necho /bin/sh", pidfile.display()));
+        let (_, elapsed) = lookup(&shell, Duration::from_secs(1));
+        // Without the bound, a lookup that waits out the job would pass too.
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        // Reparented to init after the kill; allow a moment to be reaped.
+        let stat = std::path::PathBuf::from(format!("/proc/{}/stat", pid.trim()));
+        let gone = (0..40).any(|_| {
+            let alive = std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z "));
+            if alive {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            !alive
+        });
+        assert!(gone, "background sleep {} is still running", pid.trim());
+    }
+
+    #[test]
+    fn shell_that_never_exits_is_bounded() {
+        let shell = fake_shell("hang", "sleep 30");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        assert!(out.unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn shell_that_closes_stdout_but_keeps_running_is_bounded() {
+        let shell = fake_shell("closed", "exec >/dev/null\nsleep 30");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        // Some (not None) shows the shell really ran and closed its stdout.
+        assert_eq!(out.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn failing_shell_returns_no_path() {
+        let shell = fake_shell("fail", "exit 1");
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some(&b""[..]));
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn deadline_already_passed_returns_promptly() {
+        let shell = fake_shell("late", "sleep 30");
+        let (_, elapsed) = lookup(&shell, Duration::ZERO);
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn missing_shell_returns_none() {
+        let (out, _) = lookup(std::path::Path::new("/nonexistent/shell"), Duration::from_secs(1));
+        assert!(out.is_none());
+    }
 }

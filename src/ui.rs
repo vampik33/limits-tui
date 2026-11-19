@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::probe::unix_now;
-use crate::{App, SourceKind, SourceState, CLAUDE_STALE_SECS};
+use crate::{App, CLAUDE_STALE_SECS, SourceKind, SourceState};
 
 const METER_W: usize = 12;
 const NAME_W: usize = 8;
@@ -76,10 +76,7 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
     // Claude dims when its capture is old; codex/devin dim on stale-after-error
     // or while a manual refresh is in flight.
     let stale = match kind {
-        SourceKind::Claude => state
-            .last
-            .as_ref()
-            .is_some_and(|d| now - d.fetched_at > CLAUDE_STALE_SECS),
+        SourceKind::Claude => state.last.as_ref().is_some_and(|d| now - d.fetched_at > CLAUDE_STALE_SECS),
         _ => state.error.is_some() && state.last.is_some(),
     };
     let dimmed = stale || (state.updating && state.busy);
@@ -87,7 +84,10 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
 
     let mut spans = vec![
         Span::styled(format!(" {} ", b.icon), Style::default().fg(if dimmed { Color::DarkGray } else { b.color })),
-        Span::styled(format!("{:<width$}", b.name, width = NAME_W), Style::default().fg(fg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:<width$}", b.name, width = NAME_W),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        ),
     ];
 
     match (&state.last, &state.error) {
@@ -109,10 +109,7 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
                     format!(" {:>3}%", pct.round() as i64),
                     Style::default().fg(level.unwrap_or(fg)),
                 ));
-                spans.push(Span::styled(
-                    format!(" {}", countdown(w.resets_at - now)),
-                    Style::default().fg(fg),
-                ));
+                spans.push(Span::styled(format!(" {}", countdown(w.resets_at - now)), Style::default().fg(fg)));
             }
             if let Some(micros) = data.overage_micros.filter(|m| *m > 0) {
                 spans.push(Span::styled("  ·  ", dim_style()));
@@ -134,14 +131,17 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
     }
 
     if let Some(d) = &state.last {
+        // The last refresh failed: say why, so a sign-in problem doesn't look
+        // like ordinary staleness.
+        if let Some(e) = &state.error {
+            let msg = if e.code == crate::probe::ErrorCode::Failed { "update failed" } else { e.code.label() };
+            spans.push(Span::styled(format!("  ·  {msg}"), dim_style()));
+        }
         if stale {
             spans.push(Span::styled(format!("  ·  {} ago", age(now - d.fetched_at)), dim_style()));
         }
     } else if state.busy {
         spans.push(Span::styled("  updating…", dim_style()));
-    }
-    if matches!((&state.last, &state.error), (Some(_), Some(_))) && !stale {
-        spans.push(Span::styled("  ·  update failed", dim_style()));
     }
 
     Line::from(spans)
@@ -163,11 +163,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     ])
     .split(inner);
 
-    for (kind, row) in [
-        (SourceKind::Claude, rows[1]),
-        (SourceKind::Codex, rows[2]),
-        (SourceKind::Devin, rows[3]),
-    ] {
+    for (kind, row) in [(SourceKind::Claude, rows[1]), (SourceKind::Codex, rows[2]), (SourceKind::Devin, rows[3])] {
         f.render_widget(Paragraph::new(source_row(kind, app.source_ref(kind))), row);
     }
 
@@ -178,4 +174,86 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled(" quit", dim_style()),
     ]);
     f.render_widget(Paragraph::new(help), rows[5]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::{ErrorCode, FetchOk, ProbeError, UsageWindow};
+
+    fn cached(resets_in: i64, fetched_ago: i64) -> FetchOk {
+        let now = unix_now();
+        FetchOk {
+            windows: vec![UsageWindow { label: "5h", used_percent: 42.0, resets_at: now + resets_in }],
+            plan: None,
+            overage_micros: None,
+            fetched_at: now - fetched_ago,
+        }
+    }
+
+    fn row_text(kind: SourceKind, last: Option<FetchOk>, error: Option<ErrorCode>) -> String {
+        let mut state = SourceState::new();
+        state.last = last;
+        state.error = error.map(|code| ProbeError::new(code, "detail"));
+        source_row(kind, &state).spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn codex_cached_with_auth_error_shows_not_signed_in() {
+        let text = row_text(SourceKind::Codex, Some(cached(3600, 60)), Some(ErrorCode::NotSignedIn));
+        assert!(text.contains("42%"), "{text}");
+        assert!(text.contains("not signed in"), "{text}");
+        assert!(text.contains("ago"), "{text}");
+    }
+
+    #[test]
+    fn codex_cached_with_generic_error_shows_update_failed() {
+        let text = row_text(SourceKind::Codex, Some(cached(3600, 60)), Some(ErrorCode::Failed));
+        assert!(text.contains("update failed"), "{text}");
+        assert!(text.contains("ago"), "{text}");
+    }
+
+    #[test]
+    fn devin_cached_with_timeout_shows_timeout() {
+        let text = row_text(SourceKind::Devin, Some(cached(3600, 60)), Some(ErrorCode::Timeout));
+        assert!(text.contains("timeout"), "{text}");
+    }
+
+    #[test]
+    fn codex_expired_windows_with_auth_error_shows_not_signed_in() {
+        let text = row_text(SourceKind::Codex, Some(cached(-10, 600)), Some(ErrorCode::NotSignedIn));
+        assert!(text.contains('…'), "{text}");
+        assert!(text.contains("not signed in"), "{text}");
+    }
+
+    #[test]
+    fn claude_fresh_with_error_shows_update_failed_without_age() {
+        let text = row_text(SourceKind::Claude, Some(cached(3600, 60)), Some(ErrorCode::Failed));
+        assert!(text.contains("update failed"), "{text}");
+        assert!(!text.contains("ago"), "{text}");
+    }
+
+    #[test]
+    fn claude_stale_with_error_shows_label_and_age() {
+        let text = row_text(SourceKind::Claude, Some(cached(3600, CLAUDE_STALE_SECS + 60)), Some(ErrorCode::Failed));
+        assert!(text.contains("update failed"), "{text}");
+        assert!(text.contains("ago"), "{text}");
+    }
+
+    #[test]
+    fn cached_without_error_shows_no_error_label() {
+        for kind in [SourceKind::Claude, SourceKind::Codex, SourceKind::Devin] {
+            let text = row_text(kind, Some(cached(3600, 60)), None);
+            assert!(text.contains("42%"), "{text}");
+            for label in ["update failed", "not signed in", "timeout", "ago"] {
+                assert!(!text.contains(label), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_cache_with_auth_error_shows_not_signed_in() {
+        let text = row_text(SourceKind::Codex, None, Some(ErrorCode::NotSignedIn));
+        assert!(text.contains("not signed in"), "{text}");
+    }
 }

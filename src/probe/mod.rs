@@ -59,7 +59,7 @@ pub struct ProbeError {
 impl ProbeError {
     pub fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
-        detail.truncate(200);
+        detail.truncate(detail.floor_char_boundary(200));
         Self { code, detail }
     }
 }
@@ -67,10 +67,7 @@ impl ProbeError {
 pub type ProbeResult = Result<FetchOk, ProbeError>;
 
 pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Loose integer parse like the Python probes: real ints, or numeric strings
@@ -88,5 +85,49 @@ pub fn json_f64(v: &serde_json::Value) -> Option<f64> {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_two_byte_char_crossing_limit_is_dropped() {
+        // "é" occupies bytes 199..201, so byte 200 is not a char boundary.
+        let e = ProbeError::new(ErrorCode::Failed, format!("{}é{}", "a".repeat(199), "b".repeat(50)));
+        assert_eq!(e.detail, "a".repeat(199));
+    }
+
+    #[test]
+    fn detail_four_byte_char_crossing_limit_is_dropped() {
+        // "🦀" occupies bytes 198..202.
+        let e = ProbeError::new(ErrorCode::Failed, format!("{}🦀tail", "a".repeat(198)));
+        assert_eq!(e.detail, "a".repeat(198));
+    }
+
+    #[test]
+    fn detail_multibyte_char_ending_at_limit_is_kept() {
+        // "é" occupies bytes 198..200, so it fits exactly.
+        let e = ProbeError::new(ErrorCode::Failed, format!("{}é{}", "a".repeat(198), "b".repeat(50)));
+        assert_eq!(e.detail, format!("{}é", "a".repeat(198)));
+    }
+
+    #[test]
+    fn detail_long_ascii_is_cut_to_200_bytes() {
+        let e = ProbeError::new(ErrorCode::Failed, "a".repeat(250));
+        assert_eq!(e.detail, "a".repeat(200));
+    }
+
+    #[test]
+    fn detail_exactly_200_bytes_is_unchanged() {
+        let e = ProbeError::new(ErrorCode::Failed, "a".repeat(200));
+        assert_eq!(e.detail, "a".repeat(200));
+    }
+
+    #[test]
+    fn detail_short_and_empty_are_unchanged() {
+        assert_eq!(ProbeError::new(ErrorCode::Failed, "héllo").detail, "héllo");
+        assert_eq!(ProbeError::new(ErrorCode::Failed, "").detail, "");
     }
 }
