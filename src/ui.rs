@@ -91,7 +91,14 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
     ];
 
     match (&state.last, &state.error) {
-        (Some(data), _) => {
+        (Some(data), error) => {
+            // The last refresh failed: say why, next to the name so a narrow
+            // terminal can't clip it, and a sign-in problem doesn't look like
+            // ordinary staleness.
+            if let Some(e) = error {
+                let msg = if e.code == crate::probe::ErrorCode::Failed { "update failed" } else { e.code.label() };
+                spans.push(Span::styled(format!("{msg}  ·  "), dim_style()));
+            }
             let live: Vec<_> = data.windows.iter().filter(|w| w.resets_at > now).collect();
             if live.is_empty() {
                 spans.push(Span::styled("…", dim_style()));
@@ -131,12 +138,6 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
     }
 
     if let Some(d) = &state.last {
-        // The last refresh failed: say why, so a sign-in problem doesn't look
-        // like ordinary staleness.
-        if let Some(e) = &state.error {
-            let msg = if e.code == crate::probe::ErrorCode::Failed { "update failed" } else { e.code.label() };
-            spans.push(Span::styled(format!("  ·  {msg}"), dim_style()));
-        }
         if stale {
             spans.push(Span::styled(format!("  ·  {} ago", age(now - d.fetched_at)), dim_style()));
         }
@@ -249,6 +250,31 @@ mod tests {
                 assert!(!text.contains(label), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn error_label_is_visible_on_a_narrow_terminal() {
+        let now = unix_now();
+        let mut codex = SourceState::new();
+        codex.last = Some(FetchOk {
+            windows: vec![
+                UsageWindow { label: "5h", used_percent: 42.0, resets_at: now + 3 * 3600 },
+                UsageWindow { label: "wk", used_percent: 63.0, resets_at: now + 4 * 86400 },
+            ],
+            plan: Some("plus".into()),
+            overage_micros: None,
+            fetched_at: now - 600,
+        });
+        codex.error = Some(ProbeError::new(ErrorCode::NotSignedIn, "detail"));
+        let app = App { claude: SourceState::new(), codex, devin: SourceState::new() };
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Rows: border, padding, Claude, Codex.
+        let row: String = (0..buffer.area.width).map(|x| buffer[(x, 3)].symbol()).collect();
+        assert!(row.contains("Codex"), "{row}");
+        assert!(row.contains("not signed in"), "{row}");
     }
 
     #[test]

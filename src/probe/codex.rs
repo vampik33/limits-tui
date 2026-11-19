@@ -6,16 +6,18 @@
 //! Port of herdr-codex-limits' codex_limits.py.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, unix_now};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
-/// Most bytes of login-shell output kept; the rest is ignored.
-const SHELL_OUTPUT_CAP: u64 = 64 * 1024;
+/// Most bytes of login-shell output kept: the last ones, where the lookup
+/// result follows the login config's own output.
+const SHELL_OUTPUT_CAP: usize = 64 * 1024;
 /// How long the login shell's stdout may stay open after the shell exits
 /// before the background jobs it left holding it are killed.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
@@ -41,13 +43,64 @@ fn has_exited(child: &Child) -> std::io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-/// Stdout of `shell -lc "command -v codex"` (at most SHELL_OUTPUT_CAP bytes),
-/// or None if the shell could not be started. Returns by `shell_deadline`,
-/// apart from reaping a killed shell. Background jobs of the login config
-/// that still hold stdout once the shell has exited (or the shell itself, at
-/// the deadline) are killed with the shell's process group. Holders outside
-/// that group (setsid) can't be reached: the output printed so far is
-/// returned and the reader thread lives until they release stdout.
+/// Read what the nonblocking `stdout` has for now into `out`, keeping only
+/// its last SHELL_OUTPUT_CAP bytes. Returns whether stdout is closed (EOF or
+/// a read error).
+fn drain(stdout: &mut ChildStdout, out: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => return true,
+            Ok(n) => {
+                out.extend_from_slice(&chunk[..n]);
+                let excess = out.len().saturating_sub(SHELL_OUTPUT_CAP);
+                out.drain(..excess);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Keep draining `stdout` into `out` until `done(closed)` holds or `deadline`
+/// passes, never blocking past it. Once stdout is closed it is no longer
+/// polled.
+fn drain_until(
+    stdout: &mut ChildStdout,
+    out: &mut Vec<u8>,
+    closed: &mut bool,
+    deadline: Instant,
+    mut done: impl FnMut(bool) -> bool,
+) {
+    while !done(*closed) {
+        let step = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25));
+        if step.is_zero() {
+            return;
+        }
+        if *closed {
+            std::thread::sleep(step);
+            continue;
+        }
+        let mut fds = libc::pollfd { fd: stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: `fds` is one valid pollfd for the duration of the call and
+        // its fd is owned by `stdout`, which outlives it. The result is not
+        // needed: POLLIN, POLLHUP, POLLERR, a timeout and EINTR are all
+        // handled by draining.
+        unsafe {
+            libc::poll(&mut fds, 1, step.as_millis() as libc::c_int);
+        }
+        *closed = drain(stdout, out);
+    }
+}
+
+/// The last SHELL_OUTPUT_CAP bytes of stdout of `shell -lc "command -v
+/// codex"`, or None if the shell could not be started. Returns by
+/// `shell_deadline`, apart from reaping a killed shell. Background jobs of the
+/// login config that still hold stdout once the shell has exited (or the shell
+/// itself, at the deadline) are killed with the shell's process group. Holders
+/// outside that group (setsid) can't be reached, but the read end is closed on
+/// return, so nothing outlives the call: their later writes get EPIPE.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     let mut child = Command::new(shell)
         .args(["-lc", "command -v codex"])
@@ -57,38 +110,36 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
         .process_group(0) // a non-interactive shell keeps its background jobs in this group
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped").take(SHELL_OUTPUT_CAP);
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let (closed_tx, closed_rx) = mpsc::channel::<()>();
-    let sink = Arc::clone(&output);
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stdout.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        let _ = closed_tx.send(());
-    });
-    let until = |t: Instant| t.saturating_duration_since(Instant::now());
-
-    // Wait for the shell itself, not for stdout to close.
-    let exited = loop {
-        match has_exited(&child) {
-            Ok(true) => break true,
-            Ok(false) if Instant::now() < shell_deadline => {
-                std::thread::sleep(until(shell_deadline).min(Duration::from_millis(25)));
-            }
-            _ => break false,
-        }
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let fd = stdout.as_raw_fd();
+    // SAFETY: `fd` is the open read end owned by `stdout`; F_GETFL/F_SETFL
+    // only change its file status flags.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
     };
-    // Let stdout drain and close; something still holding it gets killed.
-    let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
-    let closed = exited && closed_rx.recv_timeout(until(grace_end)).is_ok();
-    if !closed {
+    let mut output = Vec::new();
+    // A blocking read could outlast the deadline, so without O_NONBLOCK the
+    // output is not read at all.
+    let mut closed = !nonblocking;
+
+    // (A) Wait for the shell itself, not for stdout to close; failing to
+    // check on it counts as not exited.
+    let mut exited = false;
+    drain_until(&mut stdout, &mut output, &mut closed, shell_deadline, |_| match has_exited(&child) {
+        Ok(e) => {
+            exited = e;
+            e
+        }
+        Err(_) => true,
+    });
+    // (B) Let stdout drain and close.
+    if exited {
+        let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
+        drain_until(&mut stdout, &mut output, &mut closed, grace_end, |closed| closed);
+    }
+    // (C) Kill the shell, or what still holds its stdout.
+    if !(exited && closed) {
         // SAFETY: killpg only sends a signal. The group id is the pid of our
         // child, which leads the group created by process_group(0); the child
         // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
@@ -96,11 +147,15 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
         unsafe {
             libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
         }
-        // Killed holders release stdout at once; give the reader a moment.
-        let _ = closed_rx.recv_timeout(until((Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline)));
+        // Killed holders release stdout at once.
+        let grace_end = (Instant::now() + SHELL_EXIT_GRACE).min(shell_deadline);
+        drain_until(&mut stdout, &mut output, &mut closed, grace_end, |closed| closed);
     }
+    // Close the read end: a holder outside the group must not keep anything
+    // of this call alive.
+    drop(stdout);
     let _ = child.wait();
-    Some(std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner())))
+    Some(output)
 }
 
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
@@ -403,8 +458,38 @@ mod tests {
         let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
         let out = out.unwrap();
         assert!(!out.is_empty());
-        assert!(out.len() as u64 <= SHELL_OUTPUT_CAP, "read {} bytes", out.len());
+        assert!(out.len() <= SHELL_OUTPUT_CAP, "read {} bytes", out.len());
+        // The path printed after the startup noise survives the cap.
+        assert!(
+            out.ends_with(b"\n/bin/sh\n"),
+            "tail: {:?}",
+            String::from_utf8_lossy(&out[out.len().saturating_sub(32)..])
+        );
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn read_end_is_closed_on_return() {
+        let scratch = Scratch::new("epipe");
+        let marker = scratch.path("epipe");
+        // The holder leaves the shell's group, so killpg can't reach it; it
+        // writes after the lookup returned and sees EPIPE only if nothing
+        // still holds the pipe's read end.
+        let shell = scratch.shell(&format!(
+            "setsid sh -c 'trap \"\" PIPE; sleep 1; echo late || touch {}' &\necho /bin/sh",
+            marker.display()
+        ));
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+        let failed = (0..60).any(|_| {
+            let seen = marker.exists();
+            if !seen {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            seen
+        });
+        assert!(failed, "the holder's late write succeeded: the read end outlived the lookup");
     }
 
     #[test]
