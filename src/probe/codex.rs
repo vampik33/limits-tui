@@ -12,7 +12,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, unix_now};
+use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, timeout_from_env, unix_now};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 /// Most bytes of login-shell output kept: the last ones, where the lookup
@@ -102,6 +102,15 @@ impl ShellOutput {
     }
 }
 
+/// The codex binary to run and, if it needs one, the PATH to run it with.
+struct CodexBin {
+    path: std::path::PathBuf,
+    /// Set when codex came from the login shell: our PATH lacks its directory,
+    /// and an npm shim there (`#!/usr/bin/env node`) needs the node that
+    /// nvm/volta/fnm install next to it.
+    child_path: Option<std::ffi::OsString>,
+}
+
 fn is_exe(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
@@ -171,13 +180,24 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
     Some(tail)
 }
 
+/// `dir` followed by `current` (a PATH value), skipping an empty `current`:
+/// an empty entry would mean the working directory.
+fn path_with(dir: &std::path::Path, current: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    let mut path = dir.as_os_str().to_owned();
+    if let Some(current) = current.filter(|c| !c.is_empty()) {
+        path.push(":");
+        path.push(current);
+    }
+    path
+}
+
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
 /// lack it) — same order as the Python probe.
-fn find_codex(deadline: Instant) -> Result<std::path::PathBuf, ProbeError> {
+fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(override_) = std::env::var("CODEX_BIN") {
         let p = std::path::PathBuf::from(&override_);
         if is_exe(&p) {
-            return Ok(p);
+            return Ok(CodexBin { path: p, child_path: None });
         }
         return Err(ProbeError::new(ErrorCode::Missing, "CODEX_BIN is not an executable"));
     }
@@ -185,7 +205,7 @@ fn find_codex(deadline: Instant) -> Result<std::path::PathBuf, ProbeError> {
         for dir in path.split(':') {
             let p = std::path::Path::new(dir).join("codex");
             if is_exe(&p) {
-                return Ok(p);
+                return Ok(CodexBin { path: p, child_path: None });
             }
         }
     }
@@ -196,7 +216,8 @@ fn find_codex(deadline: Instant) -> Result<std::path::PathBuf, ProbeError> {
             for line in String::from_utf8_lossy(&stdout).lines().rev() {
                 let p = std::path::PathBuf::from(line.trim());
                 if p.is_absolute() && is_exe(&p) {
-                    return Ok(p);
+                    let child_path = p.parent().map(|dir| path_with(dir, std::env::var_os("PATH")));
+                    return Ok(CodexBin { path: p, child_path });
                 }
             }
         }
@@ -204,28 +225,58 @@ fn find_codex(deadline: Instant) -> Result<std::path::PathBuf, ProbeError> {
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
 }
 
-/// Errors whose message hints the account isn't signed in.
+/// Errors whose message hints the account isn't signed in. Matches whole
+/// words, so "assign", "author" or "4012" don't count.
 fn auth_hint(text: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "auth",
+        "authenticate",
+        "authenticated",
+        "authentication",
+        "unauthenticated",
+        "unauthorized",
+        "unauthorised",
+        "oauth",
+        "login",
+        "signin",
+        "401",
+    ];
+    const PHRASES: &[&[&str]] = &[
+        &["log", "in"],
+        &["logged", "in"],
+        &["logged", "out"],
+        &["sign", "in"],
+        &["signed", "in"],
+        &["signed", "out"],
+        &["api", "key"],
+        &["chatgpt", "account"],
+    ];
     let t = text.to_lowercase();
-    ["auth", "log in", "login", "logged", "sign", "api key", "unauthorized", "unauthorised", "401", "chatgpt account"]
-        .iter()
-        .any(|h| t.contains(h))
+    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| WORDS.contains(w)) || PHRASES.iter().any(|p| words.windows(p.len()).any(|w| w == *p))
 }
 
 /// Stop the child and anything it started (the npm shim runs node, which runs
-/// codex). The child was spawned in its own process group, so kill the group.
+/// codex). The child was spawned in its own process group, so kill the group:
+/// SIGTERM, up to 1 s for the child to exit, then SIGKILL for whatever of the
+/// group is left, which would otherwise keep stdout open and block the reader.
 fn kill_tree(child: &mut Child) {
     drop(child.stdin.take());
     let pgid = child.id() as libc::pid_t;
+    // SAFETY: killpg only sends a signal. The group id is the pid of our child,
+    // which leads the group created by process_group(0); the child is not
+    // reaped yet, so the id cannot have been reused.
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
     for _ in 0..20 {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
+        // has_exited doesn't reap, so the group id stays ours for the SIGKILL.
+        if has_exited(child).unwrap_or(true) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // SAFETY: as above; still not reaped.
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
@@ -293,20 +344,30 @@ fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
         return Err(ProbeError::new(ErrorCode::NotSignedIn, "no rate limits for this account"));
     };
     let mut windows = Vec::new();
+    // A window was sent but can't be shown: a format change, not a sign-in problem.
+    let mut unrecognized = false;
     for slot in ["primary", "secondary"] {
-        let Some(w) = limits.get(slot) else { continue };
+        let Some(w) = limits.get(slot).filter(|w| !w.is_null()) else { continue };
         let label = match json_int(&w["windowDurationMins"]) {
             Some(300) => "5h",
             Some(10080) => "wk",
-            _ => continue,
+            _ => {
+                unrecognized = true;
+                continue;
+            }
         };
         let (Some(used), Some(resets)) = (json_f64(&w["usedPercent"]), json_int(&w["resetsAt"])) else {
+            unrecognized = true;
             continue;
         };
         windows.push(UsageWindow { label, used_percent: used, resets_at: resets });
     }
     if windows.is_empty() {
-        return Err(ProbeError::new(ErrorCode::NotSignedIn, "no usage windows for this account"));
+        return Err(if unrecognized {
+            ProbeError::new(ErrorCode::Failed, "usage windows in an unrecognized format")
+        } else {
+            ProbeError::new(ErrorCode::NotSignedIn, "no usage windows for this account")
+        });
     }
     // Order: short window first.
     windows.sort_by_key(|w| w.label != "5h");
@@ -319,22 +380,16 @@ fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
 }
 
 pub fn fetch() -> ProbeResult {
-    let timeout = std::env::var("CODEX_LIMITS_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
-        .max(0.001);
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let deadline = Instant::now() + timeout_from_env("CODEX_LIMITS_TIMEOUT", DEFAULT_TIMEOUT_SECS);
 
     let codex = find_codex(deadline)?;
-    let mut child = Command::new(&codex)
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0) // own group so kill_tree can take down npm-shim children
-        .spawn()
-        .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
+    let mut command = Command::new(&codex.path);
+    command.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0); // own group so kill_tree can take down npm-shim children
+    if let Some(path) = &codex.child_path {
+        command.env("PATH", path);
+    }
+    let mut child =
+        command.spawn().map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
 
     let result = (|| {
         let mut rpc = Rpc::spawn(&mut child, deadline)?;
@@ -380,10 +435,15 @@ mod tests {
         /// Write `body` as an executable `/bin/sh` script and return its path;
         /// the fake "login shell" ignores its arguments.
         fn shell(&self, body: &str) -> std::path::PathBuf {
+            self.script("shell", &format!("#!/bin/sh\n{body}\n"))
+        }
+
+        /// Write `contents` as executable file `name` and return its path.
+        fn script(&self, name: &str, contents: &str) -> std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let _writing = SCRIPTS.write().unwrap_or_else(|e| e.into_inner());
-            let path = self.path("shell");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let path = self.path(name);
+            std::fs::write(&path, contents).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         }
@@ -542,6 +602,180 @@ mod tests {
     fn missing_shell_returns_none() {
         let (out, _) = lookup(std::path::Path::new("/nonexistent/shell"), Duration::from_secs(1));
         assert!(out.is_none());
+    }
+
+    // --- child PATH for a codex found by the login shell ---
+
+    #[test]
+    fn path_with_puts_dir_first() {
+        let dir = std::path::Path::new("/home/u/.nvm/versions/node/v22/bin");
+        assert_eq!(path_with(dir, Some("/usr/bin:/bin".into())), "/home/u/.nvm/versions/node/v22/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn path_with_skips_missing_or_empty_path() {
+        let dir = std::path::Path::new("/opt/codex/bin");
+        assert_eq!(path_with(dir, None), "/opt/codex/bin");
+        assert_eq!(path_with(dir, Some("".into())), "/opt/codex/bin");
+    }
+
+    /// Run `prog` with PATH set to `path` and return its stdout, or None if it
+    /// failed.
+    fn run_with_path(prog: &std::path::Path, path: &std::ffi::OsStr) -> Option<String> {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let out = Command::new(prog).env("PATH", path).stderr(Stdio::null()).output().unwrap();
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn npm_shim_finds_the_node_next_to_it() {
+        let scratch = Scratch::new("shim");
+        // An npm-style shim and its interpreter in one dir, as nvm installs them.
+        scratch.script("fakenode", "#!/bin/sh\necho ran-by-fakenode\n");
+        let shim = scratch.script("codex", "#!/usr/bin/env fakenode\n");
+        // The process's own PATH lacks the dir: the shim fails...
+        assert_eq!(run_with_path(&shim, "/usr/bin:/bin".as_ref()), None);
+        // ...and runs once the dir comes first.
+        let path = path_with(shim.parent().unwrap(), Some("/usr/bin:/bin".into()));
+        assert_eq!(run_with_path(&shim, &path).as_deref(), Some("ran-by-fakenode\n"));
+    }
+
+    // --- kill_tree ---
+
+    fn spawn_group(script: &str) -> Child {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn kill_tree_kills_a_group_member_that_ignores_sigterm() {
+        let scratch = Scratch::new("killtree");
+        let pidfile = scratch.path("pid");
+        // The leader dies on SIGTERM; the background holder ignores it.
+        let mut child =
+            spawn_group(&format!("sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 30' &\nsleep 30", pidfile.display()));
+        assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
+        let holder = read_pid(&pidfile);
+        let start = Instant::now();
+        kill_tree(&mut child);
+        assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
+        assert!(is_gone(holder), "holder {holder} survived kill_tree");
+    }
+
+    #[test]
+    fn kill_tree_kills_a_leader_that_ignores_sigterm() {
+        let mut child = spawn_group("trap '' TERM\nsleep 30");
+        // Let the shell install its trap first.
+        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        kill_tree(&mut child);
+        assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn kill_tree_on_an_exited_child_returns_promptly() {
+        let mut child = spawn_group("exit 0");
+        assert!(wait_until(40, || has_exited(&child).unwrap_or(false)));
+        let start = Instant::now();
+        kill_tree(&mut child);
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    }
+
+    // --- normalize ---
+
+    fn window(mins: i64) -> serde_json::Value {
+        serde_json::json!({"windowDurationMins": mins, "usedPercent": 12.5, "resetsAt": 1_800_000_000})
+    }
+
+    #[test]
+    fn normalize_reads_known_windows_short_first() {
+        let d = normalize(&serde_json::json!({
+            "rateLimits": {"primary": window(10080), "secondary": window(300), "planType": "plus"}
+        }))
+        .unwrap();
+        let labels: Vec<_> = d.windows.iter().map(|w| w.label).collect();
+        assert_eq!(labels, ["5h", "wk"]);
+        assert_eq!(d.plan.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn normalize_unknown_window_length_is_failed_not_signed_out() {
+        let err = normalize(&serde_json::json!({"rateLimits": {"primary": window(1440)}})).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Failed);
+    }
+
+    #[test]
+    fn normalize_incomplete_window_is_failed_not_signed_out() {
+        let err =
+            normalize(&serde_json::json!({"rateLimits": {"primary": {"windowDurationMins": 300}}})).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Failed);
+    }
+
+    #[test]
+    fn normalize_keeps_known_window_next_to_unknown_one() {
+        let d =
+            normalize(&serde_json::json!({"rateLimits": {"primary": window(300), "secondary": window(1440)}})).unwrap();
+        assert_eq!(d.windows.len(), 1);
+        assert_eq!(d.windows[0].label, "5h");
+    }
+
+    #[test]
+    fn normalize_without_windows_is_not_signed_in() {
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"rateLimits": null}),
+            serde_json::json!({"rateLimits": {}}),
+            serde_json::json!({"rateLimits": {"primary": null, "secondary": null}}),
+        ] {
+            assert_eq!(normalize(&result).err().unwrap().code, ErrorCode::NotSignedIn, "{result}");
+        }
+    }
+
+    // --- auth_hint ---
+
+    #[test]
+    fn auth_hint_matches_sign_in_errors() {
+        for msg in [
+            "Not logged in",
+            "please log in to ChatGPT",
+            "Sign in required",
+            "sign-in expired",
+            "You are signed out",
+            "HTTP 401 Unauthorized",
+            "unauthorised",
+            "auth token expired",
+            "OAuth refresh token was rejected: invalid_grant",
+            "Authentication failed",
+            "missing API key",
+            "no ChatGPT account",
+            "login required",
+        ] {
+            assert!(auth_hint(msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn auth_hint_ignores_lookalike_words() {
+        for msg in [
+            "failed to assign thread",
+            "invalid signal handler",
+            "bad signature",
+            "design error",
+            "unknown field `author`",
+            "request id 74012",
+            "port 4010 refused",
+            "log rotated in /var/log",
+            "{\"code\":-32603,\"data\":{\"authMode\":\"chatgpt\"}}",
+        ] {
+            assert!(!auth_hint(msg), "{msg}");
+        }
     }
 
     #[test]

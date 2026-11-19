@@ -140,37 +140,41 @@ fn refresh_due(app: &mut App, tx: &mpsc::Sender<FetchMsg>, manual: bool) {
     }
 }
 
-fn next_wakeup(app: &App) -> Instant {
-    [app.claude.next_at, app.codex.next_at, app.devin.next_at]
-        .into_iter()
-        .min()
-        .unwrap()
+/// Earliest due fetch, ignoring sources with a probe in flight: their
+/// `next_at` is already past and only `apply` moves it, so counting them would
+/// spin the loop at its 10 ms floor until the probe answers.
+fn next_wakeup(app: &App) -> Option<Instant> {
+    [&app.claude, &app.codex, &app.devin].into_iter().filter(|s| !s.busy).map(|s| s.next_at).min()
 }
 
 /// One non-interactive snapshot for `--once` / unscripted checks (and for
 /// terminals that can't host a TUI). Prints one line per source.
 fn run_once() {
-    for (name, result) in [
-        ("claude", probe::claude::fetch()),
-        ("codex", probe::codex::fetch()),
-        ("devin", probe::devin::fetch()),
-    ] {
-        match result {
-            Ok(d) => {
-                let windows: Vec<String> = d
-                    .windows
-                    .iter()
-                    .map(|w| format!("{}={}% (resets {})", w.label, w.used_percent.round(), w.resets_at))
-                    .collect();
-                let extra = match (d.plan, d.overage_micros) {
-                    (Some(p), Some(m)) => format!(" plan={p} overage=${:.2}", m as f64 / 1e6),
-                    (Some(p), None) => format!(" plan={p}"),
-                    _ => String::new(),
-                };
-                println!("{name}: {}{}", windows.join(" "), extra);
+    for (name, result) in
+        [("claude", probe::claude::fetch()), ("codex", probe::codex::fetch()), ("devin", probe::devin::fetch())]
+    {
+        println!("{}", once_line(name, &result));
+    }
+}
+
+fn once_line(name: &str, result: &ProbeResult) -> String {
+    match result {
+        Ok(d) => {
+            let windows: Vec<String> = d
+                .windows
+                .iter()
+                .map(|w| format!("{}={}% (resets {})", w.label, w.used_percent.round(), w.resets_at))
+                .collect();
+            let mut extra = String::new();
+            if let Some(p) = &d.plan {
+                extra.push_str(&format!(" plan={p}"));
             }
-            Err(e) => println!("{name}: error {:?} {}", e.code, e.detail),
+            if let Some(m) = d.overage_micros {
+                extra.push_str(&format!(" overage=${:.2}", m as f64 / 1e6));
+            }
+            format!("{name}: {}{}", windows.join(" "), extra)
         }
+        Err(e) => format!("{name}: error {:?} {}", e.code, e.detail),
     }
 }
 
@@ -215,7 +219,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
 
         // Wake at 1s cadence for countdown text, or sooner for a due fetch.
         let wait = next_wakeup(&app)
-            .saturating_duration_since(Instant::now())
+            .map_or(Duration::MAX, |at| at.saturating_duration_since(Instant::now()))
             .min(Duration::from_secs(1))
             .max(Duration::from_millis(10));
         if !event::poll(wait)? {
@@ -232,5 +236,70 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use probe::{ErrorCode, UsageWindow};
+
+    fn app() -> App {
+        App { claude: SourceState::new(), codex: SourceState::new(), devin: SourceState::new() }
+    }
+
+    #[test]
+    fn next_wakeup_skips_busy_sources() {
+        let mut app = app();
+        let now = Instant::now();
+        app.claude.next_at = now + Duration::from_secs(15);
+        // Codex is due and its probe is running: the past next_at must not count.
+        app.codex.next_at = now - Duration::from_secs(1);
+        app.codex.busy = true;
+        app.devin.next_at = now + Duration::from_secs(300);
+        assert_eq!(next_wakeup(&app), Some(now + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn next_wakeup_counts_idle_due_sources() {
+        let mut app = app();
+        let now = Instant::now();
+        app.claude.next_at = now + Duration::from_secs(15);
+        app.codex.next_at = now - Duration::from_secs(1);
+        app.devin.next_at = now + Duration::from_secs(300);
+        assert_eq!(next_wakeup(&app), Some(now - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn next_wakeup_is_none_when_all_busy() {
+        let mut app = app();
+        for s in [&mut app.claude, &mut app.codex, &mut app.devin] {
+            s.busy = true;
+        }
+        assert_eq!(next_wakeup(&app), None);
+    }
+
+    fn ok(plan: Option<&str>, overage_micros: Option<i64>) -> ProbeResult {
+        Ok(FetchOk {
+            windows: vec![UsageWindow { label: "day", used_percent: 30.4, resets_at: 1_800_000_000 }],
+            plan: plan.map(String::from),
+            overage_micros,
+            fetched_at: 0,
+        })
+    }
+
+    #[test]
+    fn once_line_shows_plan_and_overage_independently() {
+        let base = "devin: day=30% (resets 1800000000)";
+        assert_eq!(once_line("devin", &ok(Some("Pro"), Some(2_500_000))), format!("{base} plan=Pro overage=$2.50"));
+        assert_eq!(once_line("devin", &ok(Some("Pro"), None)), format!("{base} plan=Pro"));
+        assert_eq!(once_line("devin", &ok(None, Some(2_500_000))), format!("{base} overage=$2.50"));
+        assert_eq!(once_line("devin", &ok(None, None)), base);
+    }
+
+    #[test]
+    fn once_line_shows_errors() {
+        let err = Err(ProbeError::new(ErrorCode::Timeout, "slow"));
+        assert_eq!(once_line("codex", &err), "codex: error Timeout slow");
     }
 }

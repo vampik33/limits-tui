@@ -1,9 +1,9 @@
 //! Devin CLI quota usage: read the credentials TOML and POST GetUserStatus to
 //! the configured API server. Port of herdr-devin-limits' devin_limits.py.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, unix_now};
+use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, timeout_from_env, unix_now};
 
 const DEFAULT_API_SERVER_URL: &str = "https://server.codeium.com";
 const STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
@@ -74,12 +74,7 @@ fn map_error(e: ureq::Error) -> ProbeError {
 }
 
 pub fn fetch() -> ProbeResult {
-    let timeout = std::env::var("DEVIN_LIMITS_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
-        .max(0.001);
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let deadline = Instant::now() + timeout_from_env("DEVIN_LIMITS_TIMEOUT", DEFAULT_TIMEOUT_SECS);
 
     let creds = load_credentials()?;
     let url = status_url(&creds.api_server_url)?;
@@ -173,8 +168,14 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         return Err(ProbeError::new(ErrorCode::NoQuota, "no quota windows are available"));
     }
 
-    let overage = json_int(&plan_status["overageBalanceMicros"])
-        .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "API response has an invalid overage balance"))?;
+    // Connect's JSON omits zero-valued fields, so a missing balance is not an error.
+    let overage = match plan_status.get("overageBalanceMicros") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            json_int(v)
+                .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "API response has an invalid overage balance"))?,
+        ),
+    };
     let plan = match plan_info.get("planName") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(s.clone()),
@@ -182,7 +183,7 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
             return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid plan name"));
         }
     };
-    Ok(FetchOk { windows, plan, overage_micros: Some(overage), fetched_at: unix_now() })
+    Ok(FetchOk { windows, plan, overage_micros: overage, fetched_at: unix_now() })
 }
 
 #[cfg(test)]
@@ -234,5 +235,49 @@ mod tests {
     fn status_url_rejects_other_schemes_starting_with_https() {
         assert!(status_url("https+unix://example.com").is_err());
         assert!(status_url("httpsx://example.com").is_err());
+    }
+
+    /// A quota-plan payload with a daily window and the given overage field
+    /// (`None` leaves the field out).
+    fn payload(overage: Option<serde_json::Value>) -> serde_json::Value {
+        let mut status = serde_json::json!({
+            "planInfo": {"billingStrategy": QUOTA_BILLING_STRATEGY, "planName": "Pro"},
+            "dailyQuotaRemainingPercent": 70,
+            "dailyQuotaResetAtUnix": "1800000000",
+        });
+        if let Some(v) = overage {
+            status["overageBalanceMicros"] = v;
+        }
+        serde_json::json!({"userStatus": {"planStatus": status}})
+    }
+
+    #[test]
+    fn missing_overage_keeps_the_windows() {
+        let d = normalize(&payload(None), "key").unwrap();
+        assert_eq!(d.overage_micros, None);
+        assert_eq!(d.windows.len(), 1);
+        assert_eq!(d.windows[0].used_percent, 30.0);
+    }
+
+    #[test]
+    fn null_overage_keeps_the_windows() {
+        let d = normalize(&payload(Some(serde_json::Value::Null)), "key").unwrap();
+        assert_eq!(d.overage_micros, None);
+        assert_eq!(d.windows.len(), 1);
+    }
+
+    #[test]
+    fn overage_as_number_or_string_is_read() {
+        assert_eq!(normalize(&payload(Some(2_500_000.into())), "key").unwrap().overage_micros, Some(2_500_000));
+        assert_eq!(normalize(&payload(Some("2500000".into())), "key").unwrap().overage_micros, Some(2_500_000));
+    }
+
+    #[test]
+    fn invalid_overage_is_still_an_error() {
+        for bad in [serde_json::json!("lots"), serde_json::json!(true), serde_json::json!({})] {
+            let err = normalize(&payload(Some(bad.clone())), "key").err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{bad}");
+            assert!(err.detail.contains("overage"), "{bad}: {}", err.detail);
+        }
     }
 }
