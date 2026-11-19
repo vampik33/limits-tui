@@ -5,11 +5,10 @@
 //!
 //! Port of herdr-codex-limits' codex_limits.py.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, timeout_from_env, unix_now};
@@ -25,16 +24,21 @@ const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
 /// own output (printed earlier) can't be mistaken for it.
 const LOGIN_MARKER: &str = "@@limits-tui@@";
 
-/// The login shell's stdout, read without blocking, and the last
-/// SHELL_OUTPUT_CAP bytes it printed.
-struct ShellOutput {
+/// Most bytes one `Pipe::step` reads, so a writer that never pauses can't keep
+/// a step going past its deadline.
+const PIPE_READ_BURST: usize = 64 * 1024;
+
+/// A child's stdout, read without blocking on the caller's thread, so no read
+/// outlasts a deadline and no reader thread is left for a holder of the write
+/// end (a descendant outside the child's process group) to pin. Dropping it
+/// closes the read end; such a holder's later writes get EPIPE.
+struct Pipe {
     stdout: ChildStdout,
-    tail: Vec<u8>,
-    /// EOF or a read error; a closed stdout is no longer polled.
+    /// EOF or a read error; a closed pipe is no longer polled.
     closed: bool,
 }
 
-impl ShellOutput {
+impl Pipe {
     fn new(stdout: ChildStdout) -> Self {
         let fd = stdout.as_raw_fd();
         // SAFETY: `fd` is the open read end owned by `stdout`; F_GETFL/F_SETFL
@@ -44,13 +48,14 @@ impl ShellOutput {
             flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
         };
         // A blocking read could outlast the deadline, so without O_NONBLOCK
-        // the output is not read at all.
-        Self { stdout, tail: Vec::new(), closed: !nonblocking }
+        // the pipe is not read at all.
+        Self { stdout, closed: !nonblocking }
     }
 
-    /// Wait up to 25 ms, never past `deadline`, for output and read it.
-    /// Returns false once `deadline` has passed.
-    fn step(&mut self, deadline: Instant) -> bool {
+    /// Wait up to 25 ms, never past `deadline`, for output and pass what was
+    /// read to `sink`, chunk by chunk. Returns false once `deadline` has
+    /// passed.
+    fn step(&mut self, deadline: Instant, sink: impl FnMut(&[u8])) -> bool {
         let step = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25));
         if step.is_zero() {
             return false;
@@ -67,28 +72,23 @@ impl ShellOutput {
         unsafe {
             libc::poll(&mut fds, 1, step.as_millis() as libc::c_int);
         }
-        self.drain();
+        self.drain(sink);
         true
     }
 
-    /// Read until stdout closes or SHELL_EXIT_GRACE passes, never past
-    /// `deadline`.
-    fn settle(&mut self, deadline: Instant) {
-        let end = (Instant::now() + SHELL_EXIT_GRACE).min(deadline);
-        while !self.closed && self.step(end) {}
-    }
-
-    /// Read what stdout has for now, keeping only the last SHELL_OUTPUT_CAP
-    /// bytes.
-    fn drain(&mut self) {
+    /// Read what the pipe has for now, up to PIPE_READ_BURST bytes.
+    fn drain(&mut self, mut sink: impl FnMut(&[u8])) {
         let mut chunk = [0u8; 4096];
+        let mut read = 0;
         loop {
+            if read >= PIPE_READ_BURST {
+                return;
+            }
             match self.stdout.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    self.tail.extend_from_slice(&chunk[..n]);
-                    let excess = self.tail.len().saturating_sub(SHELL_OUTPUT_CAP);
-                    self.tail.drain(..excess);
+                    sink(&chunk[..n]);
+                    read += n;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
@@ -96,6 +96,36 @@ impl ShellOutput {
             }
         }
         self.closed = true;
+    }
+}
+
+/// The login shell's stdout and the last SHELL_OUTPUT_CAP bytes it printed.
+struct ShellOutput {
+    pipe: Pipe,
+    tail: Vec<u8>,
+}
+
+impl ShellOutput {
+    fn new(stdout: ChildStdout) -> Self {
+        Self { pipe: Pipe::new(stdout), tail: Vec::new() }
+    }
+
+    /// Wait up to 25 ms, never past `deadline`, for output and keep it.
+    /// Returns false once `deadline` has passed.
+    fn step(&mut self, deadline: Instant) -> bool {
+        let tail = &mut self.tail;
+        self.pipe.step(deadline, |chunk| {
+            tail.extend_from_slice(chunk);
+            let excess = tail.len().saturating_sub(SHELL_OUTPUT_CAP);
+            tail.drain(..excess);
+        })
+    }
+
+    /// Read until stdout closes or SHELL_EXIT_GRACE passes, never past
+    /// `deadline`.
+    fn settle(&mut self, deadline: Instant) {
+        let end = (Instant::now() + SHELL_EXIT_GRACE).min(deadline);
+        while !self.pipe.closed && self.step(end) {}
     }
 
     /// The output kept so far. Consuming `self` closes the read end, so a
@@ -172,7 +202,7 @@ fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Optio
         output.settle(shell_deadline);
     }
     // (C) Kill the shell, or what still holds its stdout.
-    if !(exited && output.closed) {
+    if !(exited && output.pipe.closed) {
         // SAFETY: killpg only sends a signal. The group id is the pid of our
         // child, which leads the group created by process_group(0); the child
         // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
@@ -339,8 +369,8 @@ fn response_result(msg: &serde_json::Value) -> Result<serde_json::Value, ProbeEr
 
 /// Stop the child and anything it started (the npm shim runs node, which runs
 /// codex) by signalling its process group: SIGTERM, up to 1 s for the child to
-/// exit, then SIGKILL for what is left of the group, which would otherwise
-/// keep stdout open and block the reader.
+/// exit, then SIGKILL for what is left of the group, so nothing it started
+/// outlives the probe.
 fn kill_tree(child: &mut Child) {
     drop(child.stdin.take());
     let pgid = child.id() as libc::pid_t;
@@ -364,9 +394,13 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Newline-delimited JSON-RPC with the app server over its stdio. Its stdout
+/// is read on this thread, so dropping the Rpc releases it completely.
 struct Rpc {
     stdin: std::process::ChildStdin,
-    lines: mpsc::Receiver<Option<String>>,
+    stdout: Pipe,
+    /// Output read but not yet split into lines.
+    pending: Vec<u8>,
     deadline: Instant,
 }
 
@@ -374,16 +408,11 @@ impl Rpc {
     fn spawn(child: &mut Child, deadline: Instant) -> Result<Self, ProbeError> {
         let stdin = child.stdin.take().ok_or_else(|| ProbeError::new(ErrorCode::Failed, "no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| ProbeError::new(ErrorCode::Failed, "no stdout"))?;
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if tx.send(Some(line.unwrap_or_default())).is_err() {
-                    return;
-                }
-            }
-            let _ = tx.send(None);
-        });
-        Ok(Self { stdin, lines, deadline })
+        let stdout = Pipe::new(stdout);
+        if stdout.closed {
+            return Err(ProbeError::new(ErrorCode::Failed, "cannot read codex app-server output without blocking"));
+        }
+        Ok(Self { stdin, stdout, pending: Vec::new(), deadline })
     }
 
     fn send(&mut self, msg: &serde_json::Value) -> Result<(), ProbeError> {
@@ -393,24 +422,33 @@ impl Rpc {
     }
 
     /// The response with this id; notifications and other lines are skipped.
-    fn wait_for(&self, request_id: i64) -> Result<serde_json::Value, ProbeError> {
+    fn wait_for(&mut self, request_id: i64) -> Result<serde_json::Value, ProbeError> {
         loop {
-            let remaining = self.deadline.checked_duration_since(Instant::now());
-            let Some(remaining) = remaining else {
-                return Err(ProbeError::new(ErrorCode::Timeout, "codex app-server did not answer in time"));
-            };
-            let line = match self.lines.recv_timeout(remaining) {
-                Ok(Some(l)) => l,
-                Ok(None) => return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited")),
-                Err(_) => return Err(ProbeError::new(ErrorCode::Timeout, "codex app-server did not answer in time")),
-            };
-            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if msg.get("id").and_then(|i| i.as_i64()) != Some(request_id) {
-                continue;
+            while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                if let Some(msg) = response_line(&line, request_id) {
+                    return response_result(&msg);
+                }
             }
-            return response_result(&msg);
+            if self.stdout.closed {
+                // At EOF, a last line may lack its newline.
+                if let Some(msg) = response_line(&std::mem::take(&mut self.pending), request_id) {
+                    return response_result(&msg);
+                }
+                return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited"));
+            }
+            let pending = &mut self.pending;
+            if !self.stdout.step(self.deadline, |chunk| pending.extend_from_slice(chunk)) {
+                return Err(ProbeError::new(ErrorCode::Timeout, "codex app-server did not answer in time"));
+            }
         }
     }
+}
+
+/// `line` as JSON, if it is the response with this id.
+fn response_line(line: &[u8], request_id: i64) -> Option<serde_json::Value> {
+    let msg: serde_json::Value = serde_json::from_slice(line).ok()?;
+    (msg.get("id").and_then(|i| i.as_i64()) == Some(request_id)).then_some(msg)
 }
 
 fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
@@ -459,7 +497,13 @@ pub fn fetch() -> ProbeResult {
     let deadline = Instant::now() + timeout_from_env("CODEX_LIMITS_TIMEOUT", DEFAULT_TIMEOUT_SECS);
 
     let codex = find_codex(deadline)?;
-    let mut child = app_server_command(&codex)
+    read_rate_limits(&codex, deadline)
+}
+
+/// Ask `codex app-server` for the account's rate limits, by `deadline`, then
+/// stop it.
+fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
+    let mut child = app_server_command(codex)
         .spawn()
         .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
 
@@ -904,6 +948,121 @@ mod tests {
         let start = Instant::now();
         kill_tree(&mut child);
         assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    }
+
+    // --- read_rate_limits against a fake app server ---
+
+    const INIT_REPLY: &str = r#"{"id":0,"result":{}}"#;
+    const LIMITS_REPLY: &str = r#"{"id":1,"result":{"rateLimits":{"primary":{"windowDurationMins":300,"usedPercent":5,"resetsAt":1800000000}}}}"#;
+
+    /// `read_rate_limits` with the `/bin/sh` script `body` as `codex
+    /// app-server`; INIT and LIMITS in it stand for the two replies.
+    fn rate_limits_from(scratch: &Scratch, body: &str, budget: Duration) -> (ProbeResult, Duration) {
+        let body = body.replace("INIT", &format!("'{INIT_REPLY}'")).replace("LIMITS", &format!("'{LIMITS_REPLY}'"));
+        let codex = scratch.script("codex", &format!("#!/bin/sh\n{body}\n"));
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        let result = read_rate_limits(&CodexBin { path: codex, child_path: None }, start + budget);
+        (result, start.elapsed())
+    }
+
+    fn expect_ok(result: ProbeResult) -> FetchOk {
+        match result {
+            Ok(d) => d,
+            Err(e) => panic!("expected rate limits, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn app_server_replies_are_read_past_noise_and_split_writes() {
+        let scratch = Scratch::new("rpcok");
+        // Startup noise, a notification first, the init reply in two writes,
+        // and a notification sharing a write with the limits reply.
+        let (result, elapsed) = rate_limits_from(
+            &scratch,
+            "echo starting up\nread line\necho '{\"method\":\"remoteControl/status/changed\",\"params\":{}}'\n\
+             printf '%s' '{\"id\":0,'\nsleep 0.1\necho '\"result\":{}}'\nread line\nread line\n\
+             printf '%s\\n%s\\n' '{\"method\":\"account/updated\",\"params\":{}}' LIMITS\nsleep 30",
+            Duration::from_secs(10),
+        );
+        let d = expect_ok(result);
+        assert_eq!(d.windows.len(), 1);
+        assert_eq!((d.windows[0].label, d.windows[0].used_percent), ("5h", 5.0));
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn last_reply_without_newline_is_read_at_exit() {
+        let scratch = Scratch::new("rpceof");
+        let (result, _) = rate_limits_from(
+            &scratch,
+            "read line\necho INIT\nread line\nread line\nprintf '%s' LIMITS",
+            Duration::from_secs(10),
+        );
+        expect_ok(result);
+    }
+
+    #[test]
+    fn app_server_that_exits_without_answering_fails_at_once() {
+        let scratch = Scratch::new("rpcexit");
+        let (result, elapsed) = rate_limits_from(&scratch, "read line\nexit 0", Duration::from_secs(10));
+        let err = result.err().expect("should fail");
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn silent_app_server_times_out_by_the_deadline() {
+        let scratch = Scratch::new("rpcsilent");
+        let (result, elapsed) = rate_limits_from(&scratch, "sleep 30", Duration::from_secs(1));
+        assert_eq!(result.err().expect("should fail").code, ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn writer_that_never_pauses_cannot_hold_past_the_deadline() {
+        let scratch = Scratch::new("rpcflood");
+        let (result, elapsed) =
+            rate_limits_from(&scratch, "read line\nyes '{\"method\":\"noise\"}'", Duration::from_secs(1));
+        assert_eq!(result.err().expect("should fail").code, ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn setsid_holder_of_stdout_keeps_nothing_of_the_probe_alive() {
+        let scratch = Scratch::new("rpcsetsid");
+        let (ready, go, marker, pidfile) =
+            (scratch.path("ready"), scratch.path("go"), scratch.path("epipe"), scratch.path("pid"));
+        // The holder leaves the app server's process group, beyond kill_tree,
+        // with its stdout; the server answers only once it has (else killpg
+        // would take the holder down before setsid ran). Once told to, the
+        // holder writes: that fails with EPIPE only if nothing of the probe
+        // (a reader thread) still holds the pipe's read end.
+        let (result, elapsed) = rate_limits_from(
+            &scratch,
+            &format!(
+                "setsid sh -c 'touch {ready}; trap \"\" PIPE; i=0; while [ ! -e {go} ] && [ $i -lt 100 ]; do \
+                 sleep 0.1; i=$((i+1)); done; echo late || touch {marker}' &\necho $! > {pid}\n\
+                 i=0; while [ ! -e {ready} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
+                 read line\necho INIT\nread line\nread line\necho LIMITS\nsleep 30",
+                ready = ready.display(),
+                go = go.display(),
+                marker = marker.display(),
+                pid = pidfile.display()
+            ),
+            Duration::from_secs(10),
+        );
+        expect_ok(result);
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+        assert!(ready.exists(), "the holder never left the process group");
+        std::fs::write(&go, "").unwrap();
+        let reached_epipe = wait_until(60, || marker.exists());
+        let holder = read_pid(&pidfile);
+        // SAFETY: plain signal to the test's own holder, in case it lingers.
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+        }
+        assert!(reached_epipe, "the holder's late write succeeded: the read end outlived the probe");
     }
 
     // --- normalize ---
