@@ -110,8 +110,7 @@ impl ShellOutput {
         Self { pipe: Pipe::new(stdout), tail: Vec::new() }
     }
 
-    /// Wait up to 25 ms, never past `deadline`, for output and keep it.
-    /// Returns false once `deadline` has passed.
+    /// `Pipe::step`, keeping the output's tail.
     fn step(&mut self, deadline: Instant) -> bool {
         let tail = &mut self.tail;
         self.pipe.step(deadline, |chunk| {
@@ -424,18 +423,27 @@ impl Rpc {
     /// The response with this id; notifications and other lines are skipped.
     fn wait_for(&mut self, request_id: i64) -> Result<serde_json::Value, ProbeError> {
         loop {
-            while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = self.pending.drain(..=end).collect();
-                if let Some(msg) = response_line(&line, request_id) {
-                    return response_result(&msg);
+            // Complete lines, consumed in one drain after the scan.
+            let mut start = 0;
+            let mut response = None;
+            while let Some(len) = self.pending[start..].iter().position(|&b| b == b'\n') {
+                response = response_line(&self.pending[start..start + len], request_id);
+                start += len + 1;
+                if response.is_some() {
+                    break;
                 }
             }
+            self.pending.drain(..start);
+            if let Some(response) = response {
+                return response;
+            }
             if self.stdout.closed {
-                // At EOF, a last line may lack its newline.
-                if let Some(msg) = response_line(&std::mem::take(&mut self.pending), request_id) {
-                    return response_result(&msg);
+                if self.pending.is_empty() {
+                    return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited"));
                 }
-                return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited"));
+                // EOF ends the last line too.
+                self.pending.push(b'\n');
+                continue;
             }
             let pending = &mut self.pending;
             if !self.stdout.step(self.deadline, |chunk| pending.extend_from_slice(chunk)) {
@@ -445,10 +453,10 @@ impl Rpc {
     }
 }
 
-/// `line` as JSON, if it is the response with this id.
-fn response_line(line: &[u8], request_id: i64) -> Option<serde_json::Value> {
+/// The outcome of the request with this id, if `line` is its response.
+fn response_line(line: &[u8], request_id: i64) -> Option<Result<serde_json::Value, ProbeError>> {
     let msg: serde_json::Value = serde_json::from_slice(line).ok()?;
-    (msg.get("id").and_then(|i| i.as_i64()) == Some(request_id)).then_some(msg)
+    (msg.get("id").and_then(|i| i.as_i64()) == Some(request_id)).then(|| response_result(&msg))
 }
 
 fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
@@ -956,10 +964,10 @@ mod tests {
     const LIMITS_REPLY: &str = r#"{"id":1,"result":{"rateLimits":{"primary":{"windowDurationMins":300,"usedPercent":5,"resetsAt":1800000000}}}}"#;
 
     /// `read_rate_limits` with the `/bin/sh` script `body` as `codex
-    /// app-server`; INIT and LIMITS in it stand for the two replies.
+    /// app-server`; `$INIT` and `$LIMITS` in it hold the two replies.
     fn rate_limits_from(scratch: &Scratch, body: &str, budget: Duration) -> (ProbeResult, Duration) {
-        let body = body.replace("INIT", &format!("'{INIT_REPLY}'")).replace("LIMITS", &format!("'{LIMITS_REPLY}'"));
-        let codex = scratch.script("codex", &format!("#!/bin/sh\n{body}\n"));
+        let codex =
+            scratch.script("codex", &format!("#!/bin/sh\nINIT='{INIT_REPLY}'\nLIMITS='{LIMITS_REPLY}'\n{body}\n"));
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let result = read_rate_limits(&CodexBin { path: codex, child_path: None }, start + budget);
@@ -973,6 +981,10 @@ mod tests {
         }
     }
 
+    fn expect_err(result: ProbeResult) -> ProbeError {
+        result.err().expect("expected an error, got rate limits")
+    }
+
     #[test]
     fn app_server_replies_are_read_past_noise_and_split_writes() {
         let scratch = Scratch::new("rpcok");
@@ -982,7 +994,7 @@ mod tests {
             &scratch,
             "echo starting up\nread line\necho '{\"method\":\"remoteControl/status/changed\",\"params\":{}}'\n\
              printf '%s' '{\"id\":0,'\nsleep 0.1\necho '\"result\":{}}'\nread line\nread line\n\
-             printf '%s\\n%s\\n' '{\"method\":\"account/updated\",\"params\":{}}' LIMITS\nsleep 30",
+             printf '%s\\n%s\\n' '{\"method\":\"account/updated\",\"params\":{}}' \"$LIMITS\"\nsleep 30",
             Duration::from_secs(10),
         );
         let d = expect_ok(result);
@@ -996,7 +1008,7 @@ mod tests {
         let scratch = Scratch::new("rpceof");
         let (result, _) = rate_limits_from(
             &scratch,
-            "read line\necho INIT\nread line\nread line\nprintf '%s' LIMITS",
+            "read line\necho \"$INIT\"\nread line\nread line\nprintf '%s' \"$LIMITS\"",
             Duration::from_secs(10),
         );
         expect_ok(result);
@@ -1006,7 +1018,7 @@ mod tests {
     fn app_server_that_exits_without_answering_fails_at_once() {
         let scratch = Scratch::new("rpcexit");
         let (result, elapsed) = rate_limits_from(&scratch, "read line\nexit 0", Duration::from_secs(10));
-        let err = result.err().expect("should fail");
+        let err = expect_err(result);
         assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
@@ -1015,7 +1027,7 @@ mod tests {
     fn silent_app_server_times_out_by_the_deadline() {
         let scratch = Scratch::new("rpcsilent");
         let (result, elapsed) = rate_limits_from(&scratch, "sleep 30", Duration::from_secs(1));
-        assert_eq!(result.err().expect("should fail").code, ErrorCode::Timeout);
+        assert_eq!(expect_err(result).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 
@@ -1024,7 +1036,7 @@ mod tests {
         let scratch = Scratch::new("rpcflood");
         let (result, elapsed) =
             rate_limits_from(&scratch, "read line\nyes '{\"method\":\"noise\"}'", Duration::from_secs(1));
-        assert_eq!(result.err().expect("should fail").code, ErrorCode::Timeout);
+        assert_eq!(expect_err(result).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 
@@ -1044,7 +1056,7 @@ mod tests {
                 "setsid sh -c 'touch {ready}; trap \"\" PIPE; i=0; while [ ! -e {go} ] && [ $i -lt 100 ]; do \
                  sleep 0.1; i=$((i+1)); done; echo late || touch {marker}' &\necho $! > {pid}\n\
                  i=0; while [ ! -e {ready} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n\
-                 read line\necho INIT\nread line\nread line\necho LIMITS\nsleep 30",
+                 read line\necho \"$INIT\"\nread line\nread line\necho \"$LIMITS\"\nsleep 30",
                 ready = ready.display(),
                 go = go.display(),
                 marker = marker.display(),
