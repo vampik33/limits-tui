@@ -12,6 +12,9 @@ const CLAUDE_POLL: Duration = Duration::from_secs(15);
 /// Codex/Devin spawn a process or hit the network — poll like the mods do.
 const PROBE_POLL: Duration = Duration::from_secs(5 * 60);
 const PROBE_RETRY: Duration = Duration::from_secs(60);
+/// A running probe answers through a channel that `event::poll` can't watch,
+/// so check it this often until the probe is done.
+const PROBE_CHECK: Duration = Duration::from_millis(100);
 /// Refetch just after a reset passes so the new window shows up promptly.
 const AFTER_RESET: i64 = 15;
 /// Claude data older than this renders dimmed.
@@ -43,6 +46,15 @@ struct SourceState {
 impl SourceState {
     fn new() -> Self {
         Self { last: None, error: None, busy: false, updating: false, failures: 0, next_at: Instant::now() }
+    }
+
+    /// Mark a probe as started. Its result sets `next_at` through `apply`;
+    /// until then `next_at` moves a poll ahead, so the source isn't due (and
+    /// doesn't pin the loop's wakeup to the past) while the probe runs.
+    fn start_probe(&mut self, manual: bool) {
+        self.busy = true;
+        self.updating = manual;
+        self.next_at = Instant::now() + PROBE_POLL;
     }
 
     fn apply(&mut self, result: ProbeResult) {
@@ -132,8 +144,7 @@ fn refresh_due(app: &mut App, tx: &mpsc::Sender<FetchMsg>, manual: bool) {
                     }
                     continue;
                 }
-                src.busy = true;
-                src.updating = manual;
+                src.start_probe(manual);
                 spawn_probe(kind, tx.clone());
             }
         }
@@ -141,36 +152,44 @@ fn refresh_due(app: &mut App, tx: &mpsc::Sender<FetchMsg>, manual: bool) {
 }
 
 fn next_wakeup(app: &App) -> Instant {
-    [app.claude.next_at, app.codex.next_at, app.devin.next_at]
-        .into_iter()
-        .min()
-        .unwrap()
+    [app.claude.next_at, app.codex.next_at, app.devin.next_at].into_iter().min().unwrap()
+}
+
+/// How long to wait for a key: until the next due fetch, but at most 1 s (for
+/// the countdown text), or PROBE_CHECK while a probe runs; at least 10 ms.
+fn poll_wait(app: &App, now: Instant) -> Duration {
+    let cap = if app.codex.busy || app.devin.busy { PROBE_CHECK } else { Duration::from_secs(1) };
+    next_wakeup(app).saturating_duration_since(now).min(cap).max(Duration::from_millis(10))
 }
 
 /// One non-interactive snapshot for `--once` / unscripted checks (and for
 /// terminals that can't host a TUI). Prints one line per source.
 fn run_once() {
-    for (name, result) in [
-        ("claude", probe::claude::fetch()),
-        ("codex", probe::codex::fetch()),
-        ("devin", probe::devin::fetch()),
-    ] {
-        match result {
-            Ok(d) => {
-                let windows: Vec<String> = d
-                    .windows
-                    .iter()
-                    .map(|w| format!("{}={}% (resets {})", w.label, w.used_percent.round(), w.resets_at))
-                    .collect();
-                let extra = match (d.plan, d.overage_micros) {
-                    (Some(p), Some(m)) => format!(" plan={p} overage=${:.2}", m as f64 / 1e6),
-                    (Some(p), None) => format!(" plan={p}"),
-                    _ => String::new(),
-                };
-                println!("{name}: {}{}", windows.join(" "), extra);
+    for (name, result) in
+        [("claude", probe::claude::fetch()), ("codex", probe::codex::fetch()), ("devin", probe::devin::fetch())]
+    {
+        println!("{}", once_line(name, &result));
+    }
+}
+
+fn once_line(name: &str, result: &ProbeResult) -> String {
+    match result {
+        Ok(d) => {
+            let windows: Vec<String> = d
+                .windows
+                .iter()
+                .map(|w| format!("{}={}% (resets {})", w.label, w.used_percent.round(), w.resets_at))
+                .collect();
+            let mut extra = String::new();
+            if let Some(p) = &d.plan {
+                extra.push_str(&format!(" plan={p}"));
             }
-            Err(e) => println!("{name}: error {:?} {}", e.code, e.detail),
+            if let Some(m) = d.overage_micros {
+                extra.push_str(&format!(" overage=${:.2}", m as f64 / 1e6));
+            }
+            format!("{name}: {}{}", windows.join(" "), extra)
         }
+        Err(e) => format!("{name}: error {:?} {}", e.code, e.detail),
     }
 }
 
@@ -213,12 +232,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
 
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        // Wake at 1s cadence for countdown text, or sooner for a due fetch.
-        let wait = next_wakeup(&app)
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(1))
-            .max(Duration::from_millis(10));
-        if !event::poll(wait)? {
+        if !event::poll(poll_wait(&app, Instant::now()))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -232,5 +246,82 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use probe::{ErrorCode, UsageWindow};
+
+    /// An app with every source due a minute after `now`.
+    fn app_at(now: Instant) -> App {
+        let mut app = App { claude: SourceState::new(), codex: SourceState::new(), devin: SourceState::new() };
+        for s in [&mut app.claude, &mut app.codex, &mut app.devin] {
+            s.next_at = now + Duration::from_secs(60);
+        }
+        app
+    }
+
+    #[test]
+    fn start_probe_marks_busy_and_moves_next_at_ahead() {
+        let now = Instant::now();
+        let mut src = SourceState::new();
+        src.next_at = now - Duration::from_secs(1);
+        src.start_probe(true);
+        assert!(src.busy && src.updating);
+        assert!(src.next_at >= now + PROBE_POLL, "a running probe must not stay due");
+        src.start_probe(false);
+        assert!(!src.updating);
+    }
+
+    #[test]
+    fn poll_wait_checks_often_while_a_probe_runs() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        // Codex was due; starting its probe must not leave the wakeup in the past.
+        app.codex.next_at = now - Duration::from_secs(1);
+        app.codex.start_probe(false);
+        assert_eq!(poll_wait(&app, now), PROBE_CHECK);
+    }
+
+    #[test]
+    fn poll_wait_is_one_second_when_idle() {
+        let now = Instant::now();
+        assert_eq!(poll_wait(&app_at(now), now), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn poll_wait_is_short_for_a_due_fetch_but_never_zero() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        app.claude.next_at = now + Duration::from_millis(40);
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(40));
+        app.claude.next_at = now - Duration::from_secs(1);
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(10));
+    }
+
+    fn ok(plan: Option<&str>, overage_micros: Option<i64>) -> ProbeResult {
+        Ok(FetchOk {
+            windows: vec![UsageWindow { label: "day", used_percent: 30.4, resets_at: 1_800_000_000 }],
+            plan: plan.map(String::from),
+            overage_micros,
+            fetched_at: 0,
+        })
+    }
+
+    #[test]
+    fn once_line_shows_plan_and_overage_independently() {
+        let base = "devin: day=30% (resets 1800000000)";
+        assert_eq!(once_line("devin", &ok(Some("Pro"), Some(2_500_000))), format!("{base} plan=Pro overage=$2.50"));
+        assert_eq!(once_line("devin", &ok(Some("Pro"), None)), format!("{base} plan=Pro"));
+        assert_eq!(once_line("devin", &ok(None, Some(2_500_000))), format!("{base} overage=$2.50"));
+        assert_eq!(once_line("devin", &ok(None, None)), base);
+    }
+
+    #[test]
+    fn once_line_shows_errors() {
+        let err = Err(ProbeError::new(ErrorCode::Timeout, "slow"));
+        assert_eq!(once_line("codex", &err), "codex: error Timeout slow");
     }
 }

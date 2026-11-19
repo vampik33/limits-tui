@@ -2,6 +2,13 @@ pub mod claude;
 pub mod codex;
 pub mod devin;
 
+use std::time::Duration;
+
+/// Upper bound for the *_LIMITS_TIMEOUT env vars. It keeps every deadline
+/// built from them in range: `Instant + Duration` panics on overflow, here and
+/// inside ureq.
+const MAX_TIMEOUT_SECS: f64 = 24.0 * 3600.0;
+
 /// One quota/rate-limit window as the UI needs it, normalized across sources.
 pub struct UsageWindow {
     /// Short label for the window: "5h", "day", "wk".
@@ -28,7 +35,8 @@ pub enum ErrorCode {
     NotSignedIn,
     /// Tool is not installed (codex binary missing).
     Missing,
-    /// Account uses non-quota billing (devin).
+    /// Account has no quota windows: non-quota billing (devin) or no usage
+    /// windows (codex).
     NoQuota,
     Timeout,
     /// Claude only: no capture file yet — Claude Code hasn't run here.
@@ -88,6 +96,19 @@ pub fn json_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// Probe timeout from env var `var` (seconds, may be fractional), else
+/// `default_secs`.
+pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
+    parse_timeout(std::env::var(var).ok().as_deref(), default_secs)
+}
+
+/// Unparsable values and NaN fall back to `default_secs`; the rest, infinity
+/// included, is clamped to 1 ms ..= MAX_TIMEOUT_SECS, so this never panics.
+fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {
+    let secs = raw.and_then(|s| s.parse::<f64>().ok()).filter(|t| !t.is_nan()).unwrap_or(default_secs);
+    Duration::from_secs_f64(secs.clamp(0.001, MAX_TIMEOUT_SECS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +150,37 @@ mod tests {
     fn detail_short_and_empty_are_unchanged() {
         assert_eq!(ProbeError::new(ErrorCode::Failed, "héllo").detail, "héllo");
         assert_eq!(ProbeError::new(ErrorCode::Failed, "").detail, "");
+    }
+
+    const MAX: Duration = Duration::from_secs(24 * 3600);
+
+    #[test]
+    fn timeout_unset_or_unparsable_uses_default() {
+        assert_eq!(parse_timeout(None, 15.0), Duration::from_secs(15));
+        assert_eq!(parse_timeout(Some(""), 15.0), Duration::from_secs(15));
+        assert_eq!(parse_timeout(Some("soon"), 15.0), Duration::from_secs(15));
+        assert_eq!(parse_timeout(Some("NaN"), 15.0), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn timeout_plain_values_are_kept() {
+        assert_eq!(parse_timeout(Some("2.5"), 15.0), Duration::from_millis(2500));
+        assert_eq!(parse_timeout(Some("30"), 15.0), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn timeout_zero_and_negative_become_one_millisecond() {
+        assert_eq!(parse_timeout(Some("0"), 15.0), Duration::from_millis(1));
+        assert_eq!(parse_timeout(Some("-5"), 15.0), Duration::from_millis(1));
+        assert_eq!(parse_timeout(Some("-inf"), 15.0), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn timeout_infinite_or_huge_is_capped_without_panicking() {
+        for raw in ["inf", "infinity", "1e20", "1e300", "86401"] {
+            assert_eq!(parse_timeout(Some(raw), 15.0), MAX, "{raw}");
+        }
+        // The cap leaves room to build a deadline from it.
+        let _ = std::time::Instant::now() + parse_timeout(Some("inf"), 15.0);
     }
 }
