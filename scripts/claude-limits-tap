@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Claude Code statusLine wrapper: save rate_limits for limits-tui, then render the real status line.
+input=$(cat)
+dir="$HOME/.local/state/herdr-claude-limits"
+mkdir -p "$dir"
+if printf '%s' "$input" | jq -e '.rate_limits.five_hour // .rate_limits.seven_day' >/dev/null 2>&1; then
+  tmp=$(mktemp "$dir/.rate_limits.XXXXXX")
+  printf '%s' "$input" | jq '.rate_limits + {captured_at: now}' >"$tmp" && mv -f "$tmp" "$dir/rate_limits.json" || rm -f "$tmp"
+fi
+printf '%s' "$input" | exec bunx -y ccstatusline@2.2.34
