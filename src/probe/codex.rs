@@ -27,6 +27,10 @@ const LOGIN_MARKER: &str = "@@limits-tui@@";
 /// Most bytes one `Pipe::step` reads, so a writer that never pauses can't keep
 /// a step going past its deadline.
 const PIPE_READ_BURST: usize = 64 * 1024;
+/// Longest unfinished line kept from the app server (it may grow by one
+/// PIPE_READ_BURST past this before the check), so output that never ends a
+/// line can't take memory without bound until the deadline.
+const RPC_LINE_CAP: usize = 4 * 1024 * 1024;
 
 /// A child's stdout, read without blocking on the caller's thread, so no read
 /// outlasts a deadline and no reader thread is left for a holder of the write
@@ -273,17 +277,18 @@ fn codex_on_path(path: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Codex as found by login_shell_lookup: what follows the last LOGIN_MARKER
-/// line is the login PATH, then the lookup's answer; without a marker, the
-/// whole output is the answer. Codex is the answer's last absolute, executable
-/// path, to be run with the login PATH or, if that is missing or empty, with
-/// its directory in front of `current` (our PATH, which lacks it).
+/// line is the login PATH, then the lookup's answer. Without a marker our
+/// command never ran (e.g. the login config exec'd another shell), so there is
+/// no answer: the output is the login config's own, and a path in it is not
+/// codex. Codex is the answer's last absolute, executable path, to be run with
+/// the login PATH or, if that is missing or empty, with its directory in front
+/// of `current` (our PATH, which lacks it).
 fn codex_from_login_output(stdout: &[u8], current: Option<std::ffi::OsString>) -> Option<CodexBin> {
     use std::os::unix::ffi::OsStrExt;
     let lines: Vec<&[u8]> = stdout.split(|&b| b == b'\n').collect();
-    let (login_path, answer) = match lines.iter().rposition(|line| line.trim_ascii() == LOGIN_MARKER.as_bytes()) {
-        Some(i) => (lines.get(i + 1).filter(|p| !p.is_empty()), lines.get(i + 2..).unwrap_or_default()),
-        None => (None, &lines[..]),
-    };
+    let i = lines.iter().rposition(|line| line.trim_ascii() == LOGIN_MARKER.as_bytes())?;
+    let login_path = lines.get(i + 1).filter(|p| !p.is_empty());
+    let answer = lines.get(i + 2..).unwrap_or_default();
     let path = answer
         .iter()
         .rev()
@@ -458,6 +463,10 @@ impl Rpc {
             self.pending.drain(..start);
             if let Some(response) = response {
                 return response;
+            }
+            // What is left is one unfinished line.
+            if self.pending.len() > RPC_LINE_CAP {
+                return Err(ProbeError::new(ErrorCode::Failed, "codex app-server sent an over-long line"));
             }
             if self.stdout.closed {
                 if self.pending.is_empty() {
@@ -963,10 +972,21 @@ mod tests {
     fn login_output_gives_last_executable_path_with_its_dir_on_path() {
         let scratch = Scratch::new("loginout");
         let codex = scratch.script("codex", "#!/bin/sh\n");
-        let stdout = format!("welcome!\n{}\nrelative/codex\n/nonexistent/codex\n", codex.display());
+        let stdout = format!("welcome!\n{LOGIN_MARKER}\n\n{}\nrelative/codex\n/nonexistent/codex\n", codex.display());
         let found = codex_from_login_output(stdout.as_bytes(), Some("/usr/bin".into())).unwrap();
         assert_eq!(found.path, codex);
         assert_eq!(found.child_path.unwrap(), format!("{}:/usr/bin", scratch.0.display()).as_str());
+    }
+
+    #[test]
+    fn login_output_without_marker_gives_none_whatever_it_prints() {
+        let scratch = Scratch::new("loginnomarker");
+        let codex = scratch.script("codex", "#!/bin/sh\n");
+        // Our command never ran: an executable path here is the login
+        // config's output, not the lookup's answer.
+        for stdout in [format!("{}\n", codex.display()), format!("welcome\n/usr/bin:/bin\n{}\n", codex.display())] {
+            assert!(codex_from_login_output(stdout.as_bytes(), Some("/usr/bin".into())).is_none(), "{stdout}");
+        }
     }
 
     #[test]
@@ -974,7 +994,7 @@ mod tests {
         let scratch = Scratch::new("loginnone");
         let not_exe = scratch.path("codex");
         std::fs::write(&not_exe, "").unwrap();
-        let stdout = format!("{}\nrelative/codex\n/nonexistent/codex\n", not_exe.display());
+        let stdout = format!("{LOGIN_MARKER}\n/usr/bin\n{}\nrelative/codex\n/nonexistent/codex\n", not_exe.display());
         assert!(codex_from_login_output(stdout.as_bytes(), None).is_none());
         assert!(codex_from_login_output(b"", None).is_none());
     }
@@ -1146,6 +1166,31 @@ mod tests {
             rate_limits_from(&scratch, "read line\nyes '{\"method\":\"noise\"}'", Duration::from_secs(1));
         assert_eq!(expect_err(result).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn line_that_never_ends_is_cut_off_at_the_cap() {
+        let scratch = Scratch::new("rpclongline");
+        // No newline ever: without the cap this would buffer until the deadline.
+        let (result, elapsed) =
+            rate_limits_from(&scratch, "read line\ntr '\\0' x < /dev/zero", Duration::from_secs(20));
+        let err = expect_err(result);
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+        assert!(err.detail.contains("over-long"), "{err:?}");
+        assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn long_line_under_the_cap_is_still_read() {
+        let scratch = Scratch::new("rpcbigline");
+        // A 1 MiB notification ahead of the replies is noise, not an error.
+        let (result, _) = rate_limits_from(
+            &scratch,
+            "read line\nprintf '{\"method\":\"big\",\"params\":\"'\nhead -c 1048576 /dev/zero | tr '\\0' x\n\
+             echo '\"}'\necho \"$INIT\"\nread line\nread line\necho \"$LIMITS\"\nsleep 30",
+            Duration::from_secs(20),
+        );
+        expect_ok(result);
     }
 
     #[test]
