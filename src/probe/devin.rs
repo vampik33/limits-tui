@@ -160,8 +160,8 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else {
             continue;
         };
-        let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0);
-        let used = 100i64.saturating_sub(remaining).clamp(0, 100) as f64;
+        let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0).clamp(0, 100);
+        let used = (100 - remaining) as f64;
         windows.push(UsageWindow { label, used_percent: used, resets_at: reset });
     }
     if windows.is_empty() {

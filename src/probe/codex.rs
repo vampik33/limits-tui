@@ -172,9 +172,8 @@ fn has_exited(child: &Child) -> std::io::Result<bool> {
 /// login config that still hold stdout once the shell has exited (or the shell
 /// itself, at the deadline) are killed with the shell's process group. Holders
 /// outside that group (setsid) can't be reached, but the read end is closed on
-/// return, so nothing outlives the call: their later writes get EPIPE. The
-/// shell runs in `/`, so empty or relative PATH entries can't make it, its
-/// login config or printenv run programs from our working directory.
+/// return, so nothing outlives the call: their later writes get EPIPE. Runs in
+/// `/` for the reason given at app_server_command.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
@@ -232,7 +231,9 @@ fn path_with(dir: &std::path::Path, current: Option<std::ffi::OsString>) -> std:
 }
 
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
-/// lack it) — same order as the Python probe.
+/// lack it) — same order as the Python probe. Our working directory may be an
+/// untrusted checkout: codex_on_path keeps this lookup out of it, and running
+/// the children in `/` keeps their own lookups out of it.
 fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(override_) = std::env::var("CODEX_BIN") {
         return codex_from_override(&override_);
@@ -262,8 +263,7 @@ fn codex_from_override(value: &str) -> Result<CodexBin, ProbeError> {
 }
 
 /// The first executable `codex` in the absolute dirs of `path` (a PATH value).
-/// Empty and relative entries are skipped: they name the working directory,
-/// so starting limits-tui in an untrusted checkout would run its `codex`.
+/// Empty and relative entries are skipped: they name the working directory.
 fn codex_on_path(path: &str) -> Option<std::path::PathBuf> {
     path.split(':')
         .map(std::path::Path::new)
@@ -838,15 +838,19 @@ mod tests {
         assert_eq!(codex_on_path("/nonexistent"), None);
     }
 
+    /// `path` (absolute, existing) spelled relative to the working directory.
+    fn relative_to_cwd(path: &std::path::Path) -> String {
+        let up = "../".repeat(std::env::current_dir().unwrap().components().count() - 1);
+        let relative = format!("{up}{}", path.strip_prefix("/").unwrap().display());
+        assert!(std::path::Path::new(&relative).exists(), "{relative}");
+        relative
+    }
+
     #[test]
     fn codex_on_path_skips_empty_and_relative_dirs() {
         let scratch = Scratch::new("relpath");
         scratch.script("bin/codex", "#!/bin/sh\n");
-        // The same dir, spelled relative to the working directory.
-        let cwd = std::env::current_dir().unwrap();
-        let up = "../".repeat(cwd.components().count() - 1);
-        let relative = format!("{up}{}", scratch.path("bin").strip_prefix("/").unwrap().display());
-        assert!(std::path::Path::new(&relative).join("codex").is_file(), "{relative}");
+        let relative = relative_to_cwd(&scratch.path("bin"));
         assert_eq!(codex_on_path(&relative), None);
         assert_eq!(codex_on_path(&format!(":.:{relative}:")), None);
     }
@@ -855,11 +859,7 @@ mod tests {
     fn relative_codex_override_is_made_absolute() {
         let scratch = Scratch::new("override");
         let codex = scratch.script("bin/codex", "#!/bin/sh\n");
-        // The same file, spelled relative to the working directory.
-        let cwd = std::env::current_dir().unwrap();
-        let up = "../".repeat(cwd.components().count() - 1);
-        let relative = format!("{up}{}", codex.strip_prefix("/").unwrap().display());
-        assert!(std::path::Path::new(&relative).is_file(), "{relative}");
+        let relative = relative_to_cwd(&codex);
         let found = codex_from_override(&relative).unwrap();
         assert!(found.path.is_absolute(), "{}", found.path.display());
         assert_eq!(std::fs::canonicalize(&found.path).unwrap(), std::fs::canonicalize(&codex).unwrap());

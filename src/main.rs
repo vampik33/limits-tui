@@ -66,11 +66,14 @@ impl SourceState {
                 let mut next = Instant::now() + PROBE_POLL;
                 let now = unix_now();
                 for w in &data.windows {
-                    // Saturating, and capped before it meets an Instant: a
-                    // source may send any timestamp.
-                    let until = w.resets_at.saturating_add(AFTER_RESET).saturating_sub(now);
+                    // A source may send any timestamp: saturate, then clamp.
+                    let until = w
+                        .resets_at
+                        .saturating_add(AFTER_RESET)
+                        .saturating_sub(now)
+                        .clamp(0, PROBE_POLL.as_secs() as i64);
                     if until > 0 {
-                        next = next.min(Instant::now() + Duration::from_secs(until as u64).min(PROBE_POLL));
+                        next = next.min(Instant::now() + Duration::from_secs(until as u64));
                     }
                 }
                 self.next_at = next;
@@ -175,7 +178,7 @@ fn run_once() {
 }
 
 fn once_line(name: &str, result: &ProbeResult) -> String {
-    match result {
+    let line = match result {
         Ok(d) => {
             let windows: Vec<String> = d
                 .windows
@@ -184,20 +187,20 @@ fn once_line(name: &str, result: &ProbeResult) -> String {
                 .collect();
             let mut extra = String::new();
             if let Some(p) = &d.plan {
-                extra.push_str(&format!(" plan={}", printable(p)));
+                extra.push_str(&format!(" plan={p}"));
             }
             if let Some(m) = d.overage_micros {
                 extra.push_str(&format!(" overage=${:.2}", m as f64 / 1e6));
             }
             format!("{name}: {}{}", windows.join(" "), extra)
         }
-        Err(e) => format!("{name}: error {:?} {}", e.code, printable(&e.detail)),
-    }
+        Err(e) => format!("{name}: error {:?} {}", e.code, e.detail),
+    };
+    printable(&line)
 }
 
 /// `text` with control characters escaped (`\u{1b}`): plan names and error
-/// details come from servers, and raw escape sequences would drive the
-/// terminal. (The TUI needs none of this: ratatui drops control characters.)
+/// details come from servers, and raw escape sequences would drive the terminal.
 fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
