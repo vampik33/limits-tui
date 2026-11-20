@@ -21,9 +21,11 @@ Requires `jq`, and a Claude Pro/Max subscription (`rate_limits` isn't sent other
    install -m 755 scripts/claude-limits-tap ~/.local/bin/claude-limits-tap
    ```
 
-2. The script's last line runs your real status line. It ships with
-   `bunx -y ccstatusline@2.2.34`; edit that line to whatever your current
-   `statusLine.command` is.
+2. Add your real status line at the end of the script, fed the same input:
+   `printf '%s' "$input" | exec <your current statusLine.command>`. The script
+   runs no status line by default (so it pulls in no extra package), and your
+   status bar stays empty until you add one; the comment there shows ccstatusline
+   as an example.
 
 3. Point `statusLine` in `~/.claude/settings.json` at the script (use the full path):
 

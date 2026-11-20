@@ -160,8 +160,8 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else {
             continue;
         };
-        let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0);
-        let used = (100 - remaining).clamp(0, 100) as f64;
+        let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0).clamp(0, 100);
+        let used = (100 - remaining) as f64;
         windows.push(UsageWindow { label, used_percent: used, resets_at: reset });
     }
     if windows.is_empty() {
@@ -265,6 +265,20 @@ mod tests {
     fn overage_as_number_or_string_is_read() {
         assert_eq!(normalize(&payload(Some(2_500_000.into())), "key").unwrap().overage_micros, Some(2_500_000));
         assert_eq!(normalize(&payload(Some("2500000".into())), "key").unwrap().overage_micros, Some(2_500_000));
+    }
+
+    #[test]
+    fn extreme_remaining_percent_is_clamped_without_overflow() {
+        for (remaining, used) in [
+            (serde_json::json!(-1e300), 100.0),
+            (serde_json::json!("-9223372036854775808"), 100.0),
+            (serde_json::json!(1e300), 0.0),
+            (serde_json::json!(-20), 100.0),
+        ] {
+            let mut p = payload(None);
+            p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.clone();
+            assert_eq!(normalize(&p, "key").unwrap().windows[0].used_percent, used, "{remaining}");
+        }
     }
 
     #[test]
