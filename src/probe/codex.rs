@@ -172,13 +172,16 @@ fn has_exited(child: &Child) -> std::io::Result<bool> {
 /// login config that still hold stdout once the shell has exited (or the shell
 /// itself, at the deadline) are killed with the shell's process group. Holders
 /// outside that group (setsid) can't be reached, but the read end is closed on
-/// return, so nothing outlives the call: their later writes get EPIPE.
+/// return, so nothing outlives the call: their later writes get EPIPE. The
+/// shell runs in `/`, so empty or relative PATH entries can't make it, its
+/// login config or printenv run programs from our working directory.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
     let lookup = format!("printf '%s\\n' '{LOGIN_MARKER}'; printenv PATH || echo; command -v codex");
     let mut child = Command::new(shell)
         .args(["-lc", &lookup])
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -232,11 +235,7 @@ fn path_with(dir: &std::path::Path, current: Option<std::ffi::OsString>) -> std:
 /// lack it) — same order as the Python probe.
 fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(override_) = std::env::var("CODEX_BIN") {
-        let p = std::path::PathBuf::from(&override_);
-        if is_exe(&p) {
-            return Ok(CodexBin { path: p, child_path: None });
-        }
-        return Err(ProbeError::new(ErrorCode::Missing, "CODEX_BIN is not an executable"));
+        return codex_from_override(&override_);
     }
     if let Some(p) = std::env::var("PATH").ok().and_then(|path| codex_on_path(&path)) {
         return Ok(CodexBin { path: p, child_path: None });
@@ -251,6 +250,15 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
         }
     }
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
+}
+
+/// Codex as named by CODEX_BIN, made absolute against our working directory:
+/// the app server runs in `/`, where a relative path would name another file.
+fn codex_from_override(value: &str) -> Result<CodexBin, ProbeError> {
+    match std::path::absolute(value) {
+        Ok(path) if is_exe(&path) => Ok(CodexBin { path, child_path: None }),
+        _ => Err(ProbeError::new(ErrorCode::Missing, "CODEX_BIN is not an executable")),
+    }
 }
 
 /// The first executable `codex` in the absolute dirs of `path` (a PATH value).
@@ -289,10 +297,18 @@ fn codex_from_login_output(stdout: &[u8], current: Option<std::ffi::OsString>) -
 }
 
 /// `codex app-server` with piped stdio, in its own process group so kill_tree
-/// can take down npm-shim children.
+/// can take down npm-shim children. It runs in `/`, so empty or relative
+/// entries of the PATH it inherits can't resolve the shim's `node`, or what
+/// codex itself starts, to programs in our working directory.
 fn app_server_command(codex: &CodexBin) -> Command {
     let mut command = Command::new(&codex.path);
-    command.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
+    command
+        .arg("app-server")
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
     if let Some(path) = &codex.child_path {
         command.env("PATH", path);
     }
@@ -634,6 +650,13 @@ mod tests {
     }
 
     #[test]
+    fn login_shell_runs_in_root() {
+        let scratch = Scratch::new("shellcwd");
+        let (out, _) = lookup(&scratch.shell("pwd"), Duration::from_secs(5));
+        assert_eq!(out.as_deref(), Some(&b"/\n"[..]));
+    }
+
+    #[test]
     fn background_job_holding_stdout_does_not_delay_lookup() {
         let scratch = Scratch::new("bg");
         let (out, elapsed) = lookup(&scratch.shell("sleep 30 &\necho /bin/sh"), Duration::from_secs(5));
@@ -829,6 +852,34 @@ mod tests {
     }
 
     #[test]
+    fn relative_codex_override_is_made_absolute() {
+        let scratch = Scratch::new("override");
+        let codex = scratch.script("bin/codex", "#!/bin/sh\n");
+        // The same file, spelled relative to the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = format!("{up}{}", codex.strip_prefix("/").unwrap().display());
+        assert!(std::path::Path::new(&relative).is_file(), "{relative}");
+        let found = codex_from_override(&relative).unwrap();
+        assert!(found.path.is_absolute(), "{}", found.path.display());
+        assert_eq!(std::fs::canonicalize(&found.path).unwrap(), std::fs::canonicalize(&codex).unwrap());
+        assert_eq!(found.child_path, None);
+        // An absolute override is kept as it is.
+        assert_eq!(codex_from_override(codex.to_str().unwrap()).unwrap().path, codex);
+    }
+
+    #[test]
+    fn codex_override_that_is_not_executable_is_missing() {
+        let scratch = Scratch::new("overridebad");
+        let not_exe = scratch.path("codex");
+        std::fs::write(&not_exe, "").unwrap();
+        for value in [not_exe.to_str().unwrap(), "/nonexistent/codex", "nonexistent/codex", ""] {
+            let e = codex_from_override(value).err().unwrap();
+            assert_eq!(e.code, ErrorCode::Missing, "{value:?}");
+        }
+    }
+
+    #[test]
     fn login_output_after_marker_runs_codex_with_the_login_path() {
         let scratch = Scratch::new("loginmarker");
         let codex = scratch.script("codex", "#!/bin/sh\n");
@@ -945,6 +996,14 @@ mod tests {
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["app-server"]);
     }
 
+    #[test]
+    fn app_server_command_runs_in_root() {
+        for child_path in [None, Some("/n/bin:/usr/bin".into())] {
+            let codex = CodexBin { path: "/n/bin/codex".into(), child_path };
+            assert_eq!(app_server_command(&codex).get_current_dir(), Some(std::path::Path::new("/")));
+        }
+    }
+
     // --- kill_tree ---
 
     fn spawn_group(script: &str) -> Child {
@@ -1047,6 +1106,17 @@ mod tests {
         let (result, _) = rate_limits_from(
             &scratch,
             "read line\necho \"$INIT\"\nread line\nread line\nprintf '%s' \"$LIMITS\"",
+            Duration::from_secs(10),
+        );
+        expect_ok(result);
+    }
+
+    #[test]
+    fn app_server_runs_in_root() {
+        let scratch = Scratch::new("rpccwd");
+        let (result, _) = rate_limits_from(
+            &scratch,
+            "[ \"$(pwd)\" = / ] || exit 1\nread line\necho \"$INIT\"\nread line\nread line\necho \"$LIMITS\"",
             Duration::from_secs(10),
         );
         expect_ok(result);
