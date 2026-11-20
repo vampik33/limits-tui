@@ -66,9 +66,11 @@ impl SourceState {
                 let mut next = Instant::now() + PROBE_POLL;
                 let now = unix_now();
                 for w in &data.windows {
-                    let until = w.resets_at + AFTER_RESET - now;
+                    // Saturating, and capped before it meets an Instant: a
+                    // source may send any timestamp.
+                    let until = w.resets_at.saturating_add(AFTER_RESET).saturating_sub(now);
                     if until > 0 {
-                        next = next.min(Instant::now() + Duration::from_secs(until as u64));
+                        next = next.min(Instant::now() + Duration::from_secs(until as u64).min(PROBE_POLL));
                     }
                 }
                 self.next_at = next;
@@ -182,15 +184,30 @@ fn once_line(name: &str, result: &ProbeResult) -> String {
                 .collect();
             let mut extra = String::new();
             if let Some(p) = &d.plan {
-                extra.push_str(&format!(" plan={p}"));
+                extra.push_str(&format!(" plan={}", printable(p)));
             }
             if let Some(m) = d.overage_micros {
                 extra.push_str(&format!(" overage=${:.2}", m as f64 / 1e6));
             }
             format!("{name}: {}{}", windows.join(" "), extra)
         }
-        Err(e) => format!("{name}: error {:?} {}", e.code, e.detail),
+        Err(e) => format!("{name}: error {:?} {}", e.code, printable(&e.detail)),
     }
+}
+
+/// `text` with control characters escaped (`\u{1b}`): plan names and error
+/// details come from servers, and raw escape sequences would drive the
+/// terminal. (The TUI needs none of this: ratatui drops control characters.)
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn main() -> std::io::Result<()> {
@@ -323,5 +340,44 @@ mod tests {
     fn once_line_shows_errors() {
         let err = Err(ProbeError::new(ErrorCode::Timeout, "slow"));
         assert_eq!(once_line("codex", &err), "codex: error Timeout slow");
+    }
+
+    #[test]
+    fn once_line_escapes_control_characters_from_sources() {
+        let line = once_line("codex", &ok(Some("plus\x1b]0;x\x07\u{9b}2J é"), None));
+        assert!(line.ends_with(r" plan=plus\u{1b}]0;x\u{7}\u{9b}2J é"), "{line}");
+        let err = Err(ProbeError::new(ErrorCode::Failed, "boom\x1b[2J\nnext"));
+        assert_eq!(once_line("devin", &err), r"devin: error Failed boom\u{1b}[2J\u{a}next");
+        assert!(!once_line("devin", &err).chars().any(char::is_control));
+    }
+
+    fn window_resetting_at(resets_at: i64) -> ProbeResult {
+        Ok(FetchOk {
+            windows: vec![UsageWindow { label: "5h", used_percent: 1.0, resets_at }],
+            plan: None,
+            overage_micros: None,
+            fetched_at: 0,
+        })
+    }
+
+    #[test]
+    fn apply_survives_extreme_reset_times() {
+        for resets_at in [i64::MAX, i64::MAX - 10, i64::MIN, i64::MIN + 10, -1] {
+            let before = Instant::now();
+            let mut src = SourceState::new();
+            src.apply(window_resetting_at(resets_at));
+            let wait = src.next_at.saturating_duration_since(before);
+            assert!(wait <= PROBE_POLL + Duration::from_secs(1), "{resets_at}: {wait:?}");
+            assert!(src.last.is_some(), "{resets_at}");
+        }
+    }
+
+    #[test]
+    fn apply_still_refetches_just_after_a_near_reset() {
+        let before = Instant::now();
+        let mut src = SourceState::new();
+        src.apply(window_resetting_at(unix_now() + 30));
+        let wait = src.next_at.saturating_duration_since(before);
+        assert!(wait >= Duration::from_secs(40) && wait <= Duration::from_secs(50), "{wait:?}");
     }
 }

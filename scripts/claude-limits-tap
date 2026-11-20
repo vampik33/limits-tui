@@ -7,4 +7,6 @@ if printf '%s' "$input" | jq -e '.rate_limits.five_hour // .rate_limits.seven_da
   tmp=$(mktemp "$dir/.rate_limits.XXXXXX")
   printf '%s' "$input" | jq '.rate_limits + {captured_at: now}' >"$tmp" && mv -f "$tmp" "$dir/rate_limits.json" || rm -f "$tmp"
 fi
-printf '%s' "$input" | exec bunx -y ccstatusline@2.2.34
+# Your real status line goes here; by default nothing runs, so the status line
+# stays empty. Pass it the same input, e.g. for ccstatusline:
+#   printf '%s' "$input" | exec bunx -y ccstatusline@2.2.34

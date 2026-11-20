@@ -76,7 +76,7 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
     // Claude dims when its capture is old; codex/devin dim on stale-after-error
     // or while a manual refresh is in flight.
     let stale = match kind {
-        SourceKind::Claude => state.last.as_ref().is_some_and(|d| now - d.fetched_at > CLAUDE_STALE_SECS),
+        SourceKind::Claude => state.last.as_ref().is_some_and(|d| now.saturating_sub(d.fetched_at) > CLAUDE_STALE_SECS),
         _ => state.error.is_some() && state.last.is_some(),
     };
     let dimmed = stale || (state.updating && state.busy);
@@ -139,7 +139,7 @@ fn source_row(kind: SourceKind, state: &SourceState) -> Line<'static> {
 
     if let Some(d) = &state.last {
         if stale {
-            spans.push(Span::styled(format!("  ·  {} ago", age(now - d.fetched_at)), dim_style()));
+            spans.push(Span::styled(format!("  ·  {} ago", age(now.saturating_sub(d.fetched_at))), dim_style()));
         }
     } else if state.busy {
         spans.push(Span::styled("  updating…", dim_style()));
@@ -269,6 +269,16 @@ mod tests {
         let row: String = (0..buffer.area.width).map(|x| buffer[(x, 3)].symbol()).collect();
         assert!(row.contains("Codex"), "{row}");
         assert!(row.contains("not signed in"), "{row}");
+    }
+
+    #[test]
+    fn extreme_capture_times_render_without_overflow() {
+        for fetched_at in [i64::MIN, i64::MIN + 1, i64::MAX] {
+            let mut last = cached(3600, 0);
+            last.fetched_at = fetched_at;
+            let text = row_text(SourceKind::Claude, Some(last), None);
+            assert!(text.contains("42%"), "{fetched_at}: {text}");
+        }
     }
 
     #[test]

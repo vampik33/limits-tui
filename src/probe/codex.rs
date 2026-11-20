@@ -238,13 +238,8 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
         }
         return Err(ProbeError::new(ErrorCode::Missing, "CODEX_BIN is not an executable"));
     }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            let p = std::path::Path::new(dir).join("codex");
-            if is_exe(&p) {
-                return Ok(CodexBin { path: p, child_path: None });
-            }
-        }
+    if let Some(p) = std::env::var("PATH").ok().and_then(|path| codex_on_path(&path)) {
+        return Ok(CodexBin { path: p, child_path: None });
     }
     if let Ok(shell) = std::env::var("SHELL") {
         // The login shell may source slow config; bound it like the Python probe.
@@ -256,6 +251,17 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
         }
     }
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
+}
+
+/// The first executable `codex` in the absolute dirs of `path` (a PATH value).
+/// Empty and relative entries are skipped: they name the working directory,
+/// so starting limits-tui in an untrusted checkout would run its `codex`.
+fn codex_on_path(path: &str) -> Option<std::path::PathBuf> {
+    path.split(':')
+        .map(std::path::Path::new)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("codex"))
+        .find(|p| is_exe(p))
 }
 
 /// Codex as found by login_shell_lookup: what follows the last LOGIN_MARKER
@@ -546,9 +552,15 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A fresh dir only we can use: created here (never one that already
+        /// exists, which another user could have planted in a shared /tmp),
+        /// mode 0700, with a random suffix so planting can't block it either.
         fn new(test: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            use std::hash::BuildHasher;
+            use std::os::unix::fs::DirBuilderExt;
+            let random = std::collections::hash_map::RandomState::new().hash_one(test);
+            let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}-{random:016x}", std::process::id()));
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
             Self(dir)
         }
 
@@ -588,8 +600,12 @@ mod tests {
         (out, start.elapsed())
     }
 
+    /// The pid a test script wrote. Never 0 or negative: `kill` would read
+    /// those as a process group or as every process we may signal.
     fn read_pid(path: &std::path::Path) -> libc::pid_t {
-        std::fs::read_to_string(path).unwrap().trim().parse().unwrap()
+        let pid = std::fs::read_to_string(path).unwrap().trim().parse().unwrap();
+        assert!(pid > 0, "bad pid {pid} in {}", path.display());
+        pid
     }
 
     /// Whether `cond` holds within `tries` checks 50 ms apart.
@@ -788,6 +804,28 @@ mod tests {
         assert_eq!(run_with_path(&shim, &child_path).as_deref(), Some("ran-by-fakenode\n"));
         // The shim's dir in front of our PATH is not enough in this layout.
         assert_eq!(run_with_path(&shim, &path_with(&npmg, Some("/usr/bin:/bin".into()))), None);
+    }
+
+    #[test]
+    fn codex_on_path_finds_codex_in_an_absolute_dir() {
+        let scratch = Scratch::new("onpath");
+        let codex = scratch.script("bin/codex", "#!/bin/sh\n");
+        let bin = scratch.path("bin");
+        assert_eq!(codex_on_path(&format!("/nonexistent:{}", bin.display())), Some(codex));
+        assert_eq!(codex_on_path("/nonexistent"), None);
+    }
+
+    #[test]
+    fn codex_on_path_skips_empty_and_relative_dirs() {
+        let scratch = Scratch::new("relpath");
+        scratch.script("bin/codex", "#!/bin/sh\n");
+        // The same dir, spelled relative to the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = format!("{up}{}", scratch.path("bin").strip_prefix("/").unwrap().display());
+        assert!(std::path::Path::new(&relative).join("codex").is_file(), "{relative}");
+        assert_eq!(codex_on_path(&relative), None);
+        assert_eq!(codex_on_path(&format!(":.:{relative}:")), None);
     }
 
     #[test]
@@ -1185,6 +1223,26 @@ mod tests {
         ] {
             assert!(!auth_hint(msg), "{msg}");
         }
+    }
+
+    #[test]
+    fn scratch_dir_is_private_and_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+        let (a, b) = (Scratch::new("fresh"), Scratch::new("fresh"));
+        assert_ne!(a.0, b.0, "the same test name must not share a dir");
+        assert_eq!(std::fs::metadata(&a.0).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn read_pid_refuses_group_and_broadcast_pids() {
+        let scratch = Scratch::new("badpid");
+        let pidfile = scratch.path("pid");
+        for bad in ["0", "-1", "-42"] {
+            std::fs::write(&pidfile, bad).unwrap();
+            assert!(std::panic::catch_unwind(|| read_pid(&pidfile)).is_err(), "{bad}");
+        }
+        std::fs::write(&pidfile, "123\n").unwrap();
+        assert_eq!(read_pid(&pidfile), 123);
     }
 
     #[test]
