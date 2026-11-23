@@ -14,10 +14,9 @@
 set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-target="${CARGO_TARGET_DIR:-$repo/target}"
-out="$target/verify"
-bin="$target/debug/limits-tui"
-sock="${TMPDIR:-/tmp}/limits-tui-verify-$.sock"
+out="$repo/target/verify"
+bin="" # set by build(): the executable cargo reports, wherever the target dir is
+sock="${TMPDIR:-/tmp}/limits-tui-verify-$$.sock"
 tiers="${1:-all}"
 
 case "$tiers" in quick | run | all) ;; *)
@@ -33,7 +32,9 @@ cleanup() {
   tmux -S "$sock" kill-server 2>/dev/null || true
   rm -f "$sock"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() { # $1 = step, $2 = log, $3 = why
   echo "FAIL $1: $3"
@@ -100,14 +101,16 @@ once() {
 }
 
 tui() {
-  local log="$out/tui.log" t0=$SECONDS i status
+  local log="$out/tui.log" t0=$SECONDS i status q
   : >"$log"
   # Placeholder first, so remain-on-exit is set before the app starts: a crash at startup
   # then leaves its exit status and panic message in the pane.
   tmux -S "$sock" -f /dev/null new-session -d -x 120 -y 40 -s v "sleep 600" >>"$log" 2>&1 ||
     fail tui "$log" "tmux could not start"
   tmux -S "$sock" set-option -g remain-on-exit on >>"$log" 2>&1
-  tmux -S "$sock" respawn-pane -k -t v "$bin" >>"$log" 2>&1 || fail tui "$log" "tmux could not start the app"
+  # tmux runs the command through a shell: quote the path for that second parse.
+  printf -v q %q "$bin"
+  tmux -S "$sock" respawn-pane -k -t v "exec $q" >>"$log" 2>&1 || fail tui "$log" "tmux could not start the app"
   wait_for_screen "$out/screen-start.txt" "limits" "Claude" "Codex" "Devin" "r refresh" "q quit" >>"$log" ||
     fail tui "$log" "first frame incomplete"
   tmux -S "$sock" send-keys -t v r
@@ -130,10 +133,23 @@ tui() {
   echo "PASS tui ($((SECONDS - t0))s) screens: $out/screen-{start,refresh,exit}.txt"
 }
 
+# cargo build; bin = the limits-tui executable named in its compiler-artifact message, so a
+# target dir set anywhere (CARGO_TARGET_DIR, build.target-dir, build.target) is honoured.
+build() {
+  local json="$out/build.json" line re='"executable":"([^"\]*)"'
+  cargo build --message-format=json-render-diagnostics >"$json" || return
+  line=$(grep -F '"reason":"compiler-artifact"' "$json" | grep -F '"kind":["bin"]' | grep -F '"name":"limits-tui"')
+  [[ $line =~ $re ]] && bin=${BASH_REMATCH[1]}
+  [ -n "$bin" ] && [ -x "$bin" ] || {
+    echo "cargo reported no limits-tui executable (see $json)"
+    return 1
+  }
+}
+
 run_tier() {
   need cargo
   need tmux
-  step build cargo build
+  step build build
   once
   tui
 }
