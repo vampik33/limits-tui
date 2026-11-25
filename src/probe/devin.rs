@@ -66,15 +66,14 @@ impl Resolver for ChildResolver {
         cmd.args(&self.args).args([RESOLVE_ARG, &host_port, &millis.to_string()]);
         die_with_parent(&mut cmd);
         let output = run_bounded(&mut cmd, end).unwrap_or_default();
+        if Instant::now() >= end {
+            return Err(ureq::Error::Timeout(timeout.reason));
+        }
         let found: Vec<SocketAddr> =
             String::from_utf8_lossy(&output).lines().filter_map(|l| l.trim().parse().ok()).collect();
         if found.is_empty() {
-            return Err(if Instant::now() >= end {
-                ureq::Error::Timeout(timeout.reason)
-            } else {
-                // What a failed `to_socket_addrs` gives in ureq's own resolver.
-                ureq::Error::Io(std::io::Error::other(format!("could not resolve {host_port}")))
-            });
+            // What a failed `to_socket_addrs` gives in ureq's own resolver.
+            return Err(ureq::Error::Io(std::io::Error::other(format!("could not resolve {host_port}"))));
         }
         let mut addrs = self.empty();
         for addr in config.ip_family().keep_wanted(found.into_iter()).take(MAX_ADDRS) {
@@ -160,7 +159,9 @@ pub fn fetch() -> ProbeResult {
     let program = self_exe().ok_or_else(|| {
         ProbeError::new(ErrorCode::Failed, "cannot find limits-tui's own executable for the DNS lookup")
     })?;
-    let mut response = agent(ChildResolver { program, args: Vec::new(), deadline })
+    // ureq's default proxy setting: tests pass None to stay off the environment's.
+    let proxy = ureq::Proxy::try_from_env();
+    let mut response = agent(ChildResolver { program, args: Vec::new(), deadline }, proxy)
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Connect-Protocol-Version", "1")
@@ -262,8 +263,9 @@ fn self_exe() -> Option<PathBuf> {
 }
 
 /// The agent for the GetUserStatus request, bounded by `resolver.deadline`.
-fn agent(resolver: ChildResolver) -> ureq::Agent {
+fn agent(resolver: ChildResolver, proxy: Option<ureq::Proxy>) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
+        .proxy(proxy)
         .timeout_global(Some(resolver.deadline - Instant::now()))
         .http_status_as_error(false) // read the body ourselves, like the Python probe
         .https_only(true) // also refuse redirects to plain http
@@ -468,6 +470,16 @@ mod tests {
         assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
     }
 
+    #[test]
+    fn addresses_printed_by_a_lookup_cut_off_at_the_deadline_time_out() {
+        let resolver = sh_resolver("echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500));
+        let start = Instant::now();
+        let result = resolve_uri(&resolver, "https://example.com/", &Config::default());
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(ureq::Error::Timeout(_))), "{result:?}");
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    }
+
     /// Set only for the helper run by `lookup_child_dies_with_its_parent`: the
     /// token its lookup child carries.
     const PARENT_HELPER_ENV: &str = "LIMITS_TUI_TEST_PDEATH_TOKEN";
@@ -549,7 +561,7 @@ mod tests {
         let resolver = sh_resolver(&format!("echo 127.0.0.1:{port}"), Duration::from_secs(5));
         let result = {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
-            agent(resolver).post("https://devin-probe.invalid/").send("")
+            agent(resolver, None).post("https://devin-probe.invalid/").send("")
         };
         assert!(accepted.join().unwrap(), "the request never reached the child's address: {result:?}");
     }
@@ -557,7 +569,7 @@ mod tests {
     #[test]
     fn agent_still_refuses_plain_http() {
         let resolver = sh_resolver("echo 127.0.0.1:9", Duration::from_secs(5));
-        let err = agent(resolver).post("http://127.0.0.1:9/").send("").unwrap_err();
+        let err = agent(resolver, None).post("http://127.0.0.1:9/").send("").unwrap_err();
         assert!(matches!(err, ureq::Error::RequireHttpsOnly(_)), "{err}");
     }
 

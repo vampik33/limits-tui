@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 fn run(args: &[&str]) -> (Option<i32>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_limits-tui"))
         .args(args)
+        .current_dir("/")
+        .env_clear()
+        .env("HOME", concat!(env!("CARGO_TARGET_TMPDIR"), "/resolve-child-no-home"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
