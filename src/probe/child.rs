@@ -1,6 +1,6 @@
 //! Child processes bounded by a deadline: output read without blocking on the
-//! caller's thread and capped, and the whole process group killed when the
-//! deadline passes, so nothing a probe starts outlives it.
+//! caller's thread and capped, and the whole process group killed before the
+//! call returns, so nothing a probe starts outlives it.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
