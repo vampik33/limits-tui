@@ -40,8 +40,8 @@ fn is_exe(p: &std::path::Path) -> bool {
 /// The last OUTPUT_CAP bytes of stdout of `shell -lc`, printing LOGIN_MARKER,
 /// the exported PATH (an empty line if unset) and `command -v codex`, or None
 /// if the shell could not be started. Bounded by `shell_deadline` as
-/// `run_bounded` describes; that includes background jobs of the login config
-/// that still hold stdout once the shell has exited.
+/// `run_bounded` describes; that includes background jobs the login config
+/// leaves in the shell's process group.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
@@ -499,6 +499,28 @@ mod tests {
         assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
         let pid = read_pid(&pidfile);
         assert!(is_gone(pid), "background sleep {pid} is still running");
+    }
+
+    #[test]
+    fn background_job_that_released_stdout_is_killed() {
+        let scratch = Scratch::new("bgquiet");
+        let pidfile = scratch.path("pid");
+        // The job sends its output elsewhere, so the shell exits and stdout
+        // closes while the job still runs in the shell's group.
+        let shell =
+            scratch.shell(&format!("sleep 30 >/dev/null 2>&1 &\necho $! > {}\necho /bin/sh", pidfile.display()));
+        let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
+        let pid = read_pid(&pidfile);
+        let gone = is_gone(pid);
+        if !gone {
+            // SAFETY: plain signal to the test's own background sleep.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(gone, "background sleep {pid} outlived the lookup");
+        assert_eq!(out.as_deref(), Some(&b"/bin/sh\n"[..]));
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     }
 
     #[test]

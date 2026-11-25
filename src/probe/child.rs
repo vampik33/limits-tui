@@ -1,6 +1,6 @@
 //! Child processes bounded by a deadline: output read without blocking on the
-//! caller's thread and capped, and the whole process group killed when the
-//! deadline passes, so nothing a probe starts outlives it.
+//! caller's thread and capped, and the whole process group killed before the
+//! call returns, so nothing a probe starts outlives it.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -125,11 +125,12 @@ impl BoundedOutput {
 }
 
 /// The last OUTPUT_CAP bytes of stdout of `cmd`, or None if it could not be
-/// started. Returns by `deadline`, apart from reaping a killed child. Background
-/// jobs that still hold stdout once the child has exited (or the child itself,
-/// at the deadline) are killed with the child's process group. Holders outside
-/// that group (setsid) can't be reached, but the read end is closed on return,
-/// so nothing outlives the call: their later writes get EPIPE. The child runs in
+/// started. Returns by `deadline`, apart from reaping a killed child. Before it
+/// returns, the child's process group is killed: the child itself if it is
+/// still running at the deadline, and every background job left in the group,
+/// whether or not it still holds stdout. Holders outside that group (setsid)
+/// can't be reached, but the read end is closed on return, so nothing outlives
+/// the call: their later writes get EPIPE. The child runs in
 /// `/` with stdin and stderr closed, so a planted file in an untrusted working
 /// directory can't be run.
 pub(super) fn run_bounded(cmd: &mut Command, deadline: Instant) -> Option<Vec<u8>> {
@@ -156,18 +157,18 @@ pub(super) fn run_bounded(cmd: &mut Command, deadline: Instant) -> Option<Vec<u8
     if exited {
         output.settle(deadline);
     }
-    // (C) Kill the child, or what still holds its stdout.
-    if !(exited && output.pipe.closed) {
-        // SAFETY: killpg only sends a signal. The group id is the pid of our
-        // child, which leads the group created by process_group(0); the child
-        // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
-        // been reused.
-        unsafe {
-            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-        }
-        // Killed holders release stdout at once.
-        output.settle(deadline);
+    // (C) Kill the whole group, even once the child has exited and stdout
+    // has closed: a background job that sent its output elsewhere still runs
+    // in it.
+    // SAFETY: killpg only sends a signal. The group id is the pid of our
+    // child, which leads the group created by process_group(0). Only
+    // `child.wait()` below reaps the child (has_exited uses WNOWAIT), so its
+    // pid, and with it the group id, cannot have been reused yet.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
+    // Killed holders release stdout at once.
+    output.settle(deadline);
     let tail = output.into_tail();
     let _ = child.wait();
     Some(tail)
