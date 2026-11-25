@@ -11,8 +11,7 @@ Rust TUI that shows Claude, Codex and Devin usage limits. User-facing setup is i
 
 ## Rules
 
-- Coding rules are path-scoped in `.claude/rules/` and load with the files they cover: `probes.md`,
-  `source-data.md`, `tui.md`, `tests.md`.
+- Coding rules are path-scoped in `.claude/rules/` and load with the files they cover.
 - Reviews follow `REVIEW.md`, read from the base branch together with `.claude/rules/`.
 
 ## Pitfalls
