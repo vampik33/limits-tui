@@ -509,11 +509,14 @@ fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
                 continue;
             }
         };
-        let (Some(used), Some(resets)) = (json_f64(&w["usedPercent"]), json_int(&w["resetsAt"])) else {
+        let Some(window) = json_f64(&w["usedPercent"])
+            .zip(json_int(&w["resetsAt"]))
+            .and_then(|(used, resets)| UsageWindow::new(label, used, resets))
+        else {
             unrecognized = true;
             continue;
         };
-        windows.push(UsageWindow { label, used_percent: used, resets_at: resets });
+        windows.push(window);
     }
     if windows.is_empty() {
         return Err(if unrecognized {
@@ -1288,6 +1291,45 @@ mod tests {
             serde_json::json!({"rateLimits": {"primary": null, "secondary": null}}),
         ] {
             assert_eq!(normalize(&result).err().unwrap().code, ErrorCode::NoQuota, "{result}");
+        }
+    }
+
+    fn window_used(used: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"windowDurationMins": 300, "usedPercent": used, "resetsAt": 1_800_000_000})
+    }
+
+    #[test]
+    fn normalize_non_finite_percent_is_failed_not_signed_out() {
+        for used in ["NaN", "inf", "-inf"] {
+            let result = normalize(&serde_json::json!({"rateLimits": {"primary": window_used(used.into())}}));
+            assert_eq!(result.err().expect(used).code, ErrorCode::Failed, "{used}");
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_known_window_next_to_non_finite_one() {
+        let d = normalize(&serde_json::json!({
+            "rateLimits": {"primary": window_used("NaN".into()), "secondary": window(10080)}
+        }))
+        .unwrap();
+        let labels: Vec<_> = d.windows.iter().map(|w| w.label).collect();
+        assert_eq!(labels, ["wk"]);
+    }
+
+    #[test]
+    fn normalize_clamps_percent_to_0_100() {
+        for (used, want) in [
+            (serde_json::json!(-5), 0.0),
+            (serde_json::json!("-0"), 0.0),
+            (serde_json::json!(150), 100.0),
+            (serde_json::json!("1e300"), 100.0),
+            (serde_json::json!(0), 0.0),
+            (serde_json::json!(100), 100.0),
+            (serde_json::json!(12.5), 12.5),
+            (serde_json::json!("42"), 42.0),
+        ] {
+            let d = normalize(&serde_json::json!({"rateLimits": {"primary": window_used(used.clone())}})).unwrap();
+            assert_eq!(d.windows[0].used_percent.to_bits(), f64::to_bits(want), "{used}");
         }
     }
 

@@ -18,6 +18,15 @@ pub struct UsageWindow {
     pub resets_at: i64,
 }
 
+impl UsageWindow {
+    /// `None` when `used_percent` isn't finite. Otherwise it is clamped to
+    /// 0..=100, so the meter, the TUI label and `--once` show the same number.
+    pub fn new(label: &'static str, used_percent: f64, resets_at: i64) -> Option<Self> {
+        // `+ 0.0` turns -0.0 into 0.0, which `--once` would print as "-0".
+        used_percent.is_finite().then(|| Self { label, used_percent: used_percent.clamp(0.0, 100.0) + 0.0, resets_at })
+    }
+}
+
 /// A successful fetch from any source.
 pub struct FetchOk {
     pub windows: Vec<UsageWindow>,
@@ -173,6 +182,107 @@ mod tests {
         assert_eq!(parse_timeout(Some("0"), 15.0), Duration::from_millis(1));
         assert_eq!(parse_timeout(Some("-5"), 15.0), Duration::from_millis(1));
         assert_eq!(parse_timeout(Some("-inf"), 15.0), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn usage_window_rejects_non_finite_percent() {
+        for pct in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(UsageWindow::new("5h", pct, 0).is_none(), "{pct}");
+        }
+    }
+
+    #[test]
+    fn usage_window_clamps_percent_to_0_100() {
+        for (pct, want) in [
+            (-5.0, 0.0),
+            (-0.0, 0.0),
+            (-f64::MIN_POSITIVE, 0.0),
+            (f64::MIN, 0.0),
+            (100.4, 100.0),
+            (101.0, 100.0),
+            (f64::MAX, 100.0),
+        ] {
+            let w = UsageWindow::new("5h", pct, 0).unwrap();
+            assert_eq!(w.used_percent.to_bits(), f64::to_bits(want), "{pct:e}");
+        }
+    }
+
+    #[test]
+    fn usage_window_keeps_in_range_percent_label_and_reset() {
+        for pct in [0.0, 5e-324, 0.4, 12.5, 42.0, 99.5, 100.0] {
+            let w = UsageWindow::new("wk", pct, 1_800_000_000).unwrap();
+            assert_eq!(
+                (w.label, w.used_percent.to_bits(), w.resets_at),
+                ("wk", pct.to_bits(), 1_800_000_000),
+                "{pct:e}"
+            );
+        }
+    }
+
+    /// xorshift64*: fixed seed, so a failing value is reproducible.
+    fn next_u64(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    #[test]
+    fn usage_window_percent_is_always_finite_and_in_range() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            100.0,
+            -100.0,
+            0.5,
+            -0.5,
+            99.5,
+            100.5,
+            f64::EPSILON,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for edge in [0.0f64, 100.0] {
+            values.extend([edge.next_up(), edge.next_down()]);
+        }
+        // Subnormals, NaN payloads (quiet, signalling, negative), the largest finite.
+        for bits in [
+            1u64,
+            0x000F_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0001,
+            0x7FF0_0000_0000_0001,
+            0x7FF8_0000_0000_0001,
+            0xFFF8_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x7FEF_FFFF_FFFF_FFFF,
+        ] {
+            values.push(f64::from_bits(bits));
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..100_000 {
+            // Any bit pattern, then a value near the 0..=100 range.
+            values.push(f64::from_bits(next_u64(&mut state)));
+            values.push((next_u64(&mut state) >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 50.0);
+        }
+        for pct in values {
+            let Some(w) = UsageWindow::new("5h", pct, 7) else {
+                assert!(!pct.is_finite(), "{pct:e} was rejected");
+                continue;
+            };
+            let p = w.used_percent;
+            assert!(pct.is_finite(), "{pct:e} was kept");
+            assert!((0.0..=100.0).contains(&p) && p.is_sign_positive(), "{pct:e} -> {p:e}");
+            if pct > 0.0 && pct <= 100.0 {
+                assert_eq!(p.to_bits(), pct.to_bits(), "{pct:e}");
+            }
+            // The TUI label (`round() as i64`) and `--once` (`round()` printed) agree.
+            assert_eq!(p.round().to_string(), (p.round() as i64).to_string(), "{pct:e}");
+        }
     }
 
     #[test]
