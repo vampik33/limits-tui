@@ -16,7 +16,8 @@ set -uo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 out="$repo/target/verify"
 bin="" # set by build(): the executable cargo reports, wherever the target dir is
-sock="${TMPDIR:-/tmp}/limits-tui-verify-$$.sock"
+sockdir="" # set by tui(): a private directory (mktemp -d, mode 0700) for the tmux socket
+sock=""    # set by tui(): the tmux socket inside sockdir
 tiers="${1:-all}"
 
 case "$tiers" in quick | run | all) ;; *)
@@ -29,8 +30,9 @@ cd "$repo" || exit 2
 mkdir -p "$out"
 
 cleanup() {
+  [ -n "$sockdir" ] || return 0
   tmux -S "$sock" kill-server 2>/dev/null || true
-  rm -f "$sock"
+  rm -rf "$sockdir"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -126,6 +128,8 @@ once() {
 tui() {
   local log="$out/tui.log" t0=$SECONDS i status q
   : >"$log"
+  sockdir=$(mktemp -d "${TMPDIR:-/tmp}/limits-tui-verify.XXXXXXXX" 2>>"$log") || fail tui "$log" "mktemp -d failed"
+  sock="$sockdir/tmux.sock"
   # Placeholder first, so remain-on-exit is set before the app starts: a crash at startup
   # then leaves its exit status and panic message in the pane.
   tmux -S "$sock" -f /dev/null new-session -d -x 120 -y 40 -s v "sleep 600" >>"$log" 2>&1 ||
