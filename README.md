@@ -15,7 +15,8 @@ Claude, Codex and Devin usage limits in one terminal UI.
 
 ## Features
 
-- Every usage window of each service, how much of it is used and when it resets.
+- The 5-hour and weekly windows of Claude and Codex and the daily and weekly ones of Devin: how much of each is used
+  and when it resets. Other windows a service adds are not shown.
 - Read-only: it reads what each tool already stores and never changes your accounts.
 - Runs fine over SSH; `--once` prints plain lines for scripts.
 
