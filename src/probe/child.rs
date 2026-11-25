@@ -8,7 +8,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Most bytes of a bounded child's output kept: the last ones, where the
@@ -20,6 +20,10 @@ const EXIT_GRACE: Duration = Duration::from_millis(100);
 /// Most bytes one `Pipe::step` reads, so a writer that never pauses can't keep
 /// a step going past its deadline.
 const PIPE_READ_BURST: usize = 64 * 1024;
+/// Longest `kill_all` waits for spawns in flight to record their child: a
+/// spawn returns only once the child has exec'd, which can stall on a hung
+/// mount, and quitting must still restore the terminal.
+const SPAWN_WAIT: Duration = Duration::from_millis(500);
 
 /// The process groups of every live child the probes started.
 pub(super) static CHILDREN: Children = Children::new();
@@ -133,9 +137,11 @@ impl BoundedOutput {
 /// Process groups of live children, for `kill_all` to kill when the TUI quits:
 /// the probe threads that would kill them are detached and die with the
 /// process. A group is recorded from its spawn until just before its leader is
-/// reaped. The lock is held across a spawn (fork and exec), never across a wait
-/// on a child or its output, so `kill_all` never waits for a probe.
-pub(super) struct Children(Mutex<Groups>);
+/// reaped. The lock is never held across a spawn (fork and exec, which can
+/// stall on a hung mount) or a wait on a child or its output, so one probe's
+/// spawn never waits for another's, and `kill_all` waits at most SPAWN_WAIT,
+/// for spawns in flight. The condvar signals the end of a spawn.
+pub(super) struct Children(Mutex<Groups>, Condvar);
 
 struct Groups {
     /// Group ids: the pids of children spawned with `process_group(0)` and not
@@ -143,23 +149,47 @@ struct Groups {
     live: Vec<libc::pid_t>,
     /// Set by `kill_all`: no child is spawned after it.
     closed: bool,
+    /// Spawns in flight: started, but their child not recorded yet.
+    spawning: usize,
 }
 
 impl Children {
     const fn new() -> Self {
-        Self(Mutex::new(Groups { live: Vec::new(), closed: false }))
+        Self(Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }), Condvar::new())
     }
 
     /// Spawn `cmd`, which must set `process_group(0)`, and record its group.
-    /// Both happen under the lock `kill_all` takes, so a child is either
-    /// spawned before `kill_all` and killed by it, or never spawned.
+    /// The spawn runs outside the lock, counted in `spawning`; its child is
+    /// recorded under the lock, and if `kill_all` has begun by then, its group
+    /// is killed there and then. So a child is spawned before `kill_all` and
+    /// killed by it, killed by its own spawn, or never spawned. Only a spawn
+    /// still stalled in exec when `kill_all` stops waiting (SPAWN_WAIT) and the
+    /// process exits can leave a child that outlives the quit. A killed child is
+    /// still returned, for the caller to reap through `reap`.
     pub(super) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
-        let mut groups = self.lock();
-        if groups.closed {
-            return Err(std::io::Error::other("quitting: no new child"));
+        {
+            let mut groups = self.lock();
+            if groups.closed {
+                return Err(std::io::Error::other("quitting: no new child"));
+            }
+            groups.spawning += 1;
         }
-        let child = cmd.spawn()?;
-        groups.live.push(child.id() as libc::pid_t);
+        let spawned = cmd.spawn();
+        let mut groups = self.lock();
+        groups.spawning -= 1;
+        self.1.notify_all();
+        let child = spawned?;
+        let group = child.id() as libc::pid_t;
+        groups.live.push(group);
+        if groups.closed {
+            // SAFETY: killpg only sends a signal. `group` is the pid of the
+            // child just spawned, which leads the group process_group(0)
+            // created, and nothing has reaped it yet: the id cannot have been
+            // reused.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
         Ok(child)
     }
 
@@ -172,11 +202,23 @@ impl Children {
         child.wait()
     }
 
-    /// SIGKILL every recorded group and refuse new children. Doesn't wait for
+    /// Refuse new children, wait up to SPAWN_WAIT for spawns in flight to
+    /// record theirs, then SIGKILL every recorded group. A spawn that ends
+    /// after the wait kills its own child (see `spawn`). Doesn't wait for
     /// anything to exit: the probe threads (or init, once we exit) reap them.
     pub(super) fn kill_all(&self) {
         let mut groups = self.lock();
         groups.closed = true;
+        let deadline = Instant::now() + SPAWN_WAIT;
+        while groups.spawning > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // Not wait_timeout_while: its `?` would end the wait on a
+            // poisoned lock.
+            groups = self.1.wait_timeout(groups, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
         for &group in &groups.live {
             // SAFETY: killpg only sends a signal. `group` is the pid of a
             // child that leads the group process_group(0) created, and it is
@@ -188,8 +230,8 @@ impl Children {
         }
     }
 
-    /// The lock, even if a thread panicked holding it: `live` and `closed`
-    /// are each changed in one step, and quitting must still kill.
+    /// The lock, even if a thread panicked holding it: `live`, `closed` and
+    /// `spawning` are each changed in one step, and quitting must still kill.
     fn lock(&self) -> MutexGuard<'_, Groups> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -320,15 +362,6 @@ mod tests {
             .count()
     }
 
-    /// Whether no process is left in group `group`, reaped zombies included:
-    /// kill(-group, 0) fails with ESRCH.
-    fn group_gone(group: libc::pid_t) -> bool {
-        assert!(group > 1, "bad group {group}");
-        // SAFETY: signal 0 only checks that the group exists.
-        let rc = unsafe { libc::killpg(group, 0) };
-        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    }
-
     /// A child hung like a slow login shell, with a background job in its
     /// group, is killed whole by `kill_all` long before its deadline.
     fn assert_kill_all_kills_a_running_group(children: &'static Children) {
@@ -338,7 +371,12 @@ mod tests {
         children.kill_all();
         let out = done.recv_timeout(Duration::from_secs(4)).expect("the bounded run outlived kill_all");
         assert!(out.is_some());
-        assert!(wait_until(60, || group_gone(group)), "group {group} has {} live members", live_in_group(group));
+        // Zombies count as gone: the orphaned job waits for init to reap it.
+        assert!(
+            wait_until(60, || live_in_group(group) == 0),
+            "group {group} has {} live members",
+            live_in_group(group)
+        );
         assert!(children.lock().live.is_empty());
     }
 
@@ -388,6 +426,64 @@ mod tests {
         assert!(CHILDREN.lock().live.is_empty());
     }
 
+    /// A spawn stalled before exec, as on a hung mount, holds up neither
+    /// another probe's spawn nor `kill_all` past SPAWN_WAIT, and once it ends,
+    /// it kills its own child.
+    #[test]
+    fn a_stalled_spawn_blocks_neither_other_spawns_nor_kill_all() {
+        use std::os::unix::process::ExitStatusExt;
+        static CHILDREN: Children = Children::new();
+        // Held until the stalled child has forked, not through its stall: no
+        // script is open for writing while it is held, so the child inherits
+        // none, and other tests' forks and script writes wait only briefly.
+        let forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let (mut forked, forked_tx) = std::io::pipe().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = sh("exec sleep 30");
+            cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+            let fd = forked_tx.as_raw_fd();
+            // SAFETY: the hook runs in the forked child before exec and only
+            // makes async-signal-safe calls (write, nanosleep); it allocates
+            // nothing. `fd` stays open in the child: `forked_tx` outlives
+            // the spawn.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::write(fd, b"f".as_ptr().cast(), 1);
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(())
+                });
+            }
+            let spawned = CHILDREN.spawn(&mut cmd);
+            drop(forked_tx);
+            let _ = tx.send(spawned.and_then(|mut child| CHILDREN.reap(&mut child)));
+        });
+        let mut byte = [0u8; 1];
+        forked.read_exact(&mut byte).expect("the stalled spawn never forked");
+        drop(forking);
+        assert!(wait_until(40, || CHILDREN.lock().spawning == 1), "the stalled spawn is not in flight");
+
+        let out = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let start = Instant::now();
+            let out = run_bounded_with(&CHILDREN, &mut sh("echo ran"), Instant::now() + Duration::from_secs(5));
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(1), "a spawn waited {elapsed:?} for another probe's stalled spawn");
+            out
+        };
+        assert_eq!(out.as_deref(), Some(&b"ran\n"[..]));
+
+        let start = Instant::now();
+        CHILDREN.kill_all();
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(1500), "kill_all waited {elapsed:?} for a stalled spawn");
+
+        let status = rx.recv_timeout(Duration::from_secs(10)).expect("the stalled spawn never returned");
+        let status = status.expect("the stalled spawn failed");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "the stalled spawn's child ended with {status:?}");
+        assert!(CHILDREN.lock().live.is_empty());
+    }
+
     #[test]
     fn run_bounded_records_its_child_in_children() {
         use std::hash::BuildHasher;
@@ -395,10 +491,10 @@ mod tests {
         let random = std::collections::hash_map::RandomState::new().hash_one("record") % 1_000_000_000;
         let token = format!("0.000{random:09}");
         let (tx, rx) = mpsc::channel();
-        let mut cmd = sh(&format!("exec sleep 0.5 {token}"));
+        let mut cmd = sh(&format!("exec sleep 30 {token}"));
         std::thread::spawn(move || {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(run_bounded(&mut cmd, Instant::now() + Duration::from_secs(8)));
+            let _ = tx.send(run_bounded(&mut cmd, Instant::now() + Duration::from_secs(30)));
         });
         let mut pid = None;
         assert!(wait_until(40, || {
@@ -411,7 +507,19 @@ mod tests {
             pid.is_some()
         }));
         let pid: u32 = pid.unwrap();
-        assert!(CHILDREN.contains(pid), "run_bounded's child {pid} is not in CHILDREN");
+        // Checked before the kill, asserted after: a failed check must not
+        // leave the run holding SCRIPTS for its 30 s.
+        let recorded = CHILDREN.contains(pid);
+        let group = pid as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        // SAFETY: killpg only sends a signal. The child leads the group
+        // process_group(0) created and runs until this signal or its 30 s
+        // deadline; run_bounded reaps it only after that, so the id is still
+        // its own.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        assert!(recorded, "run_bounded's child {pid} is not in CHILDREN");
         rx.recv_timeout(Duration::from_secs(10)).expect("the bounded run never returned");
         assert!(!CHILDREN.contains(pid));
     }

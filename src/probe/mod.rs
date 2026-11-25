@@ -150,7 +150,8 @@ pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
 
 /// SIGKILL the process group of every child a probe still runs, and start no
 /// more. For quitting the TUI: its probe threads, which would kill them at
-/// their deadlines, die with the process. Doesn't wait for the probes.
+/// their deadlines, die with the process. Doesn't wait for the probes, only
+/// (half a second at most) for spawns in flight.
 pub fn kill_children() {
     child::CHILDREN.kill_all();
 }

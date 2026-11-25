@@ -1080,14 +1080,28 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let _ = tx.send(read_rate_limits(&CodexBin { path: codex, child_path: None }, deadline));
         });
         assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
         let pid = read_pid(&pidfile);
-        assert!(CHILDREN.contains(pid as u32), "app server {pid} is not in CHILDREN");
+        // Checked before the kill, asserted after: a failed check must not
+        // leave read_rate_limits holding SCRIPTS for its 30 s.
+        let recorded = CHILDREN.contains(pid as u32);
+        assert!(pid > 1, "bad pid {pid}");
+        // End the app server, as a quit would.
+        // SAFETY: killpg only sends a signal. `pid` (the shell, `$$`) leads
+        // the group process_group(0) created, and read_rate_limits reaps it
+        // only once it has exited (this signal; it never answers before its
+        // 30 s deadline), so the id is still its own.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        assert!(recorded, "app server {pid} is not in CHILDREN");
         let result = rx.recv_timeout(Duration::from_secs(10)).expect("read_rate_limits never returned");
-        assert_eq!(expect_err(result).code, ErrorCode::Timeout);
+        // "codex app-server exited", or "closed its input" if it died before
+        // the first request was written.
+        assert_eq!(expect_err(result).code, ErrorCode::Failed);
         assert!(!CHILDREN.contains(pid as u32), "app server {pid} is still in CHILDREN once reaped");
         assert!(is_gone(pid), "app server {pid} is still running");
     }
