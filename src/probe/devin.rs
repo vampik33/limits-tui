@@ -55,7 +55,13 @@ impl Resolver for ChildResolver {
         let now = Instant::now();
         // ureq's "no timeout" is u64::MAX seconds: `now + after` would panic.
         let end = now.checked_add(*timeout.after).map_or(self.deadline, |t| t.min(self.deadline));
-        let millis = u64::try_from(end.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX);
+        let left = end.saturating_duration_since(now);
+        if left.is_zero() {
+            return Err(ureq::Error::Timeout(timeout.reason));
+        }
+        // Rounded up, so the child never gives up before `end`: a lookup cut
+        // off by the deadline then reads as a timeout below.
+        let millis = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args).args([RESOLVE_ARG, &host_port, &millis.to_string()]);
         let output = run_bounded(&mut cmd, end).unwrap_or_default();
@@ -439,6 +445,32 @@ mod tests {
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
         assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
         assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn probe_requests_go_through_the_child_resolver() {
+        // Only the fake child knows where this name is: ureq's own resolver
+        // can't find a .invalid name, so a connection here proves the agent
+        // asked the child.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let accepted = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                if listener.accept().is_ok() {
+                    return true; // dropping the stream fails the TLS handshake
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        });
+        let resolver = sh_resolver(&format!("echo 127.0.0.1:{port}"), Duration::from_secs(5));
+        let result = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            agent(resolver).post("https://devin-probe.invalid/").send("")
+        };
+        assert!(accepted.join().unwrap(), "the request never reached the child's address: {result:?}");
     }
 
     #[test]
