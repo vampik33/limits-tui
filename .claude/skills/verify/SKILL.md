@@ -35,4 +35,4 @@ The numbers on screen (they come from your accounts), terminal sizes other than 
 - 6 clean runs on HEAD passed, with no tmux socket or process left behind.
 - Deliberately broken changes, each caught at its step: a misformatted line -> `FAIL fmt`; control characters no longer escaped in `printable` -> `FAIL test`; a panic at TUI start -> `FAIL tui` with "exited (status 101)" and the panic text; tmux missing from PATH -> `FAIL deps`.
 
-The tmux server uses its own socket in `$TMPDIR`, removed on exit, so it never touches your tmux sessions. The app only reads usage data.
+The tmux server uses its own socket in a private directory (`mktemp -d`, mode 0700) under `$TMPDIR`, removed with it on exit, so it never touches your tmux sessions. The app only reads usage data.
