@@ -31,6 +31,9 @@ const RPC_LINE_CAP: usize = 4 * 1024 * 1024;
 /// exiting), so this only lets the reads catch up; run_bounded allows the same
 /// after its child exits.
 const RPC_EXIT_GRACE: Duration = Duration::from_millis(100);
+/// Longest kill_tree waits, never past the probe's deadline, for the app
+/// server to exit on SIGTERM before it kills the group.
+const TERM_GRACE: Duration = Duration::from_secs(1);
 /// The codex binary to run and, if it needs one, the PATH to run it with.
 struct CodexBin {
     path: std::path::PathBuf,
@@ -238,10 +241,11 @@ fn response_result(msg: &serde_json::Value) -> Result<serde_json::Value, ProbeEr
 }
 
 /// Stop the child and anything it started (the npm shim runs node, which runs
-/// codex) by signalling its process group: SIGTERM, up to 1 s for the child to
-/// exit, then SIGKILL for what is left of the group, so nothing it started
-/// outlives the probe.
-fn kill_tree(child: &mut Child) {
+/// codex) by signalling its process group: SIGTERM, up to TERM_GRACE but never
+/// past `deadline` for the child to exit, then SIGKILL for what is left of the
+/// group, so nothing it started outlives the probe. At or past `deadline` the
+/// SIGKILL follows at once.
+fn kill_tree(child: &mut Child, deadline: Instant) {
     drop(child.stdin.take());
     let pgid = child.id() as libc::pid_t;
     // SAFETY: killpg only sends a signal. The group id is the pid of our child,
@@ -250,12 +254,14 @@ fn kill_tree(child: &mut Child) {
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
-    for _ in 0..20 {
-        // has_exited doesn't reap, so the group id stays ours for the SIGKILL.
-        if has_exited(child).unwrap_or(true) {
+    let grace_end = (Instant::now() + TERM_GRACE).min(deadline);
+    // has_exited doesn't reap, so the group id stays ours for the SIGKILL.
+    while !has_exited(child).unwrap_or(true) {
+        let left = grace_end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(left.min(Duration::from_millis(50)));
     }
     // SAFETY: as above; still not reaped.
     unsafe {
@@ -428,7 +434,7 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
         normalize(&rpc.wait_for(&child, 1)?)
     })();
 
-    kill_tree(&mut child);
+    kill_tree(&mut child, deadline);
     result
 }
 
@@ -988,7 +994,7 @@ mod tests {
         assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
         let holder = read_pid(&pidfile);
         let start = Instant::now();
-        kill_tree(&mut child);
+        kill_tree(&mut child, start + Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
         assert!(is_gone(holder), "holder {holder} survived kill_tree");
     }
@@ -1001,7 +1007,7 @@ mod tests {
         let mut child = spawn_group(&format!("trap '' TERM\ntouch {}\nsleep 30", ready.display()));
         assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
         let start = Instant::now();
-        kill_tree(&mut child);
+        kill_tree(&mut child, start + Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
         // SIGTERM was ignored, so only the SIGKILL can have ended it.
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
@@ -1012,8 +1018,67 @@ mod tests {
         let mut child = spawn_group("exit 0");
         assert!(wait_until(40, || has_exited(&child).unwrap_or(false)));
         let start = Instant::now();
-        kill_tree(&mut child);
+        kill_tree(&mut child, start + Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    }
+
+    /// A child whose shell ignores SIGTERM, as `spawn_group` started it, once
+    /// its trap is in place.
+    fn spawn_sigterm_ignoring_group(scratch: &Scratch) -> Child {
+        let ready = scratch.path("ready");
+        let child = spawn_group(&format!("trap '' TERM\ntouch {}\nsleep 30", ready.display()));
+        assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
+        child
+    }
+
+    #[test]
+    fn kill_tree_at_its_deadline_kills_at_once() {
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = Scratch::new("killnow");
+        let mut child = spawn_sigterm_ignoring_group(&scratch);
+        let start = Instant::now();
+        kill_tree(&mut child, start);
+        // The SIGTERM grace alone would take a second.
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn kill_tree_past_its_deadline_kills_at_once() {
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = Scratch::new("killlate");
+        let mut child = spawn_sigterm_ignoring_group(&scratch);
+        let start = Instant::now();
+        kill_tree(&mut child, start.checked_sub(Duration::from_secs(5)).expect("the clock started 5 s ago"));
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn kill_tree_ends_the_sigterm_grace_at_the_deadline() {
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = Scratch::new("killnear");
+        let mut child = spawn_sigterm_ignoring_group(&scratch);
+        let start = Instant::now();
+        let grace = Duration::from_millis(300);
+        kill_tree(&mut child, start + grace);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= grace, "cut the grace short, after {elapsed:?}");
+        assert!(elapsed < grace + Duration::from_millis(500), "took {elapsed:?}");
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn kill_tree_before_its_deadline_lets_the_child_exit_on_sigterm() {
+        let scratch = Scratch::new("killterm");
+        let ready = scratch.path("ready");
+        // The shell takes a while to exit on SIGTERM: a SIGKILL sent without
+        // the grace would cut its trap short.
+        let mut child =
+            spawn_group(&format!("trap 'sleep 0.2; exit 3' TERM\ntouch {}\nsleep 30 &\nwait", ready.display()));
+        assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
+        kill_tree(&mut child, Instant::now() + Duration::from_secs(10));
+        assert_eq!(child.wait().unwrap().code(), Some(3), "the SIGTERM trap did not finish");
     }
 
     // --- read_rate_limits against a fake app server ---
@@ -1178,7 +1243,7 @@ mod tests {
         rpc.deadline = Instant::now();
         let result = if exited { Some(rpc.wait_for(&child, 0)) } else { None };
         drop(rpc);
-        kill_tree(&mut child);
+        kill_tree(&mut child, Instant::now() + Duration::from_secs(10));
         result.expect("the fake app server did not exit")
     }
 
@@ -1211,6 +1276,58 @@ mod tests {
         let scratch = Scratch::new("rpcsilent");
         let (result, elapsed) = rate_limits_from(&scratch, "sleep 30", Duration::from_secs(1));
         assert_eq!(expect_err(result).code, ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn app_server_that_ignores_sigterm_is_killed_by_the_deadline() {
+        let scratch = Scratch::new("rpctermdeadline");
+        let (pidfile, jobfile) = (scratch.path("pid"), scratch.path("job"));
+        // The server never answers, and neither it nor the background job in
+        // its group (which inherits the ignored signal) exits on SIGTERM.
+        let budget = Duration::from_millis(1500);
+        let (result, elapsed) = rate_limits_from(
+            &scratch,
+            &format!(
+                "trap '' TERM\nsleep 30 &\necho $! > {job}\necho $$ > {pid}\nread line\nsleep 30",
+                job = jobfile.display(),
+                pid = pidfile.display()
+            ),
+            budget,
+        );
+        let (server, job) = (read_pid(&pidfile), read_pid(&jobfile));
+        let (server_gone, job_gone) = (is_gone(server), is_gone(job));
+        if !job_gone {
+            // SAFETY: plain signal to the test's own background sleep.
+            unsafe {
+                libc::kill(job, libc::SIGKILL);
+            }
+        }
+        assert_eq!(expect_err(result).code, ErrorCode::Timeout);
+        assert!(elapsed >= budget, "gave up early, after {elapsed:?}");
+        // A SIGTERM grace that ran past the deadline would add a second.
+        assert!(elapsed < budget + Duration::from_millis(500), "took {elapsed:?}");
+        assert!(server_gone, "app server {server} outlived the probe");
+        assert!(job_gone, "background job {job} outlived the probe");
+    }
+
+    #[test]
+    fn app_server_that_answered_in_time_gets_the_sigterm_grace() {
+        let scratch = Scratch::new("rpctermgrace");
+        let marker = scratch.path("termed");
+        // The server takes a while to exit on SIGTERM: a SIGKILL sent without
+        // the grace would cut its trap short.
+        let (result, elapsed) = rate_limits_from(
+            &scratch,
+            &format!(
+                "trap 'sleep 0.2; echo > {}; exit 0' TERM\nread line\necho \"$INIT\"\nread line\nread line\n\
+                 echo \"$LIMITS\"\nsleep 30 &\nwait",
+                marker.display()
+            ),
+            Duration::from_secs(10),
+        );
+        expect_ok(result);
+        assert!(marker.exists(), "the app server was killed before its SIGTERM trap finished");
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 
