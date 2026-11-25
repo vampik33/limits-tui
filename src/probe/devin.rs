@@ -371,7 +371,7 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
 mod tests {
     use super::*;
     use crate::probe::MAX_FILE_BYTES;
-    use crate::probe::tests::{Scratch, live_with, promptly, sleep_token};
+    use crate::probe::tests::{EDGE_INT_TOKENS, Scratch, live_with, promptly, sleep_token};
     use crate::probe::{SCRIPTS, wait_until};
     use ureq::config::IpFamily;
 
@@ -894,6 +894,73 @@ mod tests {
         p["userStatus"]["planStatus"]["weeklyQuotaRemainingPercent"] = 40.into();
         p["userStatus"]["planStatus"]["weeklyQuotaResetAtUnix"] = 1_800_500_000.into();
         p
+    }
+
+    /// `two_window_payload()` with planStatus `field` set to the JSON number
+    /// `token`, parsed from the reply's text as fetch does.
+    fn raw_reply(field: &str, token: &str) -> serde_json::Value {
+        let mut p = two_window_payload();
+        p["userStatus"]["planStatus"][field] = "RAW-TOKEN".into();
+        serde_json::from_str(&p.to_string().replace(r#""RAW-TOKEN""#, token)).unwrap()
+    }
+
+    #[test]
+    fn reset_time_is_judged_by_its_exact_decimal() {
+        for field in ["dailyQuotaResetAtUnix", "weeklyQuotaResetAtUnix"] {
+            for (token, int) in EDGE_INT_TOKENS {
+                let result = normalize(&raw_reply(field, token), "key");
+                match int.filter(|r| *r >= 0) {
+                    Some(reset) => {
+                        let d = result.unwrap_or_else(|e| panic!("{field}: {token}: {}", e.detail));
+                        assert!(d.windows.iter().any(|w| w.resets_at == reset), "{field}: {token}");
+                    }
+                    None => {
+                        let err = result.err().expect("should fail");
+                        assert_eq!(err.code, ErrorCode::Failed, "{field}: {token}");
+                        assert!(err.detail.contains("reset time"), "{field}: {token}: {}", err.detail);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_percent_is_judged_by_its_exact_decimal() {
+        for (label, field) in [("day", "dailyQuotaRemainingPercent"), ("wk", "weeklyQuotaRemainingPercent")] {
+            for (token, int) in EDGE_INT_TOKENS {
+                let result = normalize(&raw_reply(field, token), "key");
+                match int {
+                    Some(remaining) => {
+                        let d = result.unwrap_or_else(|e| panic!("{field}: {token}: {}", e.detail));
+                        let w = d.windows.iter().find(|w| w.label == label).expect("the window");
+                        assert_eq!(w.used_percent, (100 - remaining.clamp(0, 100)) as f64, "{field}: {token}");
+                    }
+                    None => {
+                        let err = result.err().expect("should fail");
+                        assert_eq!(err.code, ErrorCode::Failed, "{field}: {token}");
+                        assert!(err.detail.contains("quota percentage"), "{field}: {token}: {}", err.detail);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overage_is_judged_by_its_exact_decimal() {
+        for (token, int) in EDGE_INT_TOKENS {
+            let result = normalize(&raw_reply("overageBalanceMicros", token), "key");
+            match int {
+                Some(micros) => {
+                    let d = result.unwrap_or_else(|e| panic!("{token}: {}", e.detail));
+                    assert_eq!(d.overage_micros, Some(micros), "{token}");
+                }
+                None => {
+                    let err = result.err().expect("should fail");
+                    assert_eq!(err.code, ErrorCode::Failed, "{token}");
+                    assert!(err.detail.contains("overage"), "{token}: {}", err.detail);
+                }
+            }
+        }
     }
 
     #[test]

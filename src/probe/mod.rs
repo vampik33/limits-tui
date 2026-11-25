@@ -106,23 +106,69 @@ pub fn unix_now() -> i64 {
 }
 
 /// Loose integer parse like the Python probes: real ints, or numeric strings
-/// (the devin API mixes both). A number must be a whole value in the i64
-/// range (`1.0` is 1); a fraction like `0.5` or a huge value like `1e30`
-/// is `None`, so the caller reports it instead of reading a plausible int.
-/// The check sees the number as serde_json decoded it: a literal past f64
-/// precision is judged after rounding, so `300.00000000000001` reads as 300
-/// and `9.223372036854775807e18` (2^63 as a float) is `None`.
+/// (the devin API mixes both). A number must denote a whole value in the i64
+/// range (`1.0` and `1e3` are ints); a fraction like `0.5` or a huge value
+/// like `1e30` is `None`, so the caller reports it instead of reading a
+/// plausible int. The check reads the number's exact decimal text, which
+/// serde_json's `arbitrary_precision` keeps, not a rounded f64: so
+/// `300.00000000000001` and `-9223372036854775809` are `None`, and
+/// `9.223372036854775807e18` is i64::MAX.
 pub fn json_int(v: &serde_json::Value) -> Option<i64> {
-    // 2^63: i64::MIN as f64 is -2^63 exactly, but i64::MAX as f64 rounds up to 2^63, which doesn't fit.
-    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
     match v {
-        serde_json::Value::Number(n) => n.as_i64().or_else(|| {
-            let f = n.as_f64()?;
-            (f.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&f)).then_some(f as i64)
-        }),
+        serde_json::Value::Number(n) => exact_int(n.as_str()),
         serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// The i64 that the JSON number `token` denotes exactly, if it is a whole
+/// number in range. Linear in the token's length with no allocation, so an
+/// exponent like `1e999999999` costs only its digits.
+fn exact_int(token: &str) -> Option<i64> {
+    let (negative, rest) = token.strip_prefix('-').map_or((false, token), |r| (true, r));
+    let (mantissa, exponent) = rest.split_once(['e', 'E']).map_or((rest, None), |(m, e)| (m, Some(e)));
+    // JSON's grammar: digits before the point, and after it if there is one.
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((int, frac)) if all_digits(frac) => (int, frac),
+        Some(_) => return None,
+        None => (mantissa, ""),
+    };
+    if !all_digits(int) {
+        return None;
+    }
+    // Saturating: an exponent past i64 is far larger than any token's length,
+    // so the outcome below (zero, a fraction or out of range) still holds.
+    let exp = match exponent.map(str::parse::<i64>) {
+        None => 0,
+        Some(Ok(e)) => e,
+        Some(Err(e)) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => return None,
+        },
+    };
+    // The value is the digit string int + frac times 10^(exp - frac.len()).
+    let digits = || int.bytes().chain(frac.bytes());
+    let total = int.len() + frac.len();
+    let lead = digits().take_while(|&d| d == b'0').count();
+    if lead == total {
+        return Some(0);
+    }
+    let trail = digits().rev().take_while(|&d| d == b'0').count();
+    let significant = total - lead - trail;
+    // The significant digits, ending in a nonzero one, times 10^scale: whole only
+    // if scale >= 0, and within i64 (19 digits) only if it has at most 19.
+    let scale = exp.saturating_sub(frac.len() as i64).saturating_add(trail as i64);
+    if scale < 0 || (significant as i64).saturating_add(scale) > 19 {
+        return None;
+    }
+    let mut magnitude = 0u64;
+    for d in digits().skip(lead).take(significant) {
+        magnitude = magnitude.checked_mul(10)?.checked_add(u64::from(d - b'0'))?;
+    }
+    magnitude = magnitude.checked_mul(10u64.checked_pow(scale as u32)?)?;
+    if negative { 0i64.checked_sub_unsigned(magnitude) } else { i64::try_from(magnitude).ok() }
 }
 
 pub fn json_f64(v: &serde_json::Value) -> Option<f64> {
@@ -455,6 +501,20 @@ mod tests {
         }
     }
 
+    /// JSON number tokens an f64 can't tell from a nearby int (a rounded
+    /// fraction, one past either i64 bound) and the i64 bounds written with
+    /// exponents, each with what json_int reads from it. For the raw-reply
+    /// tests of every json_int caller.
+    pub(super) const EDGE_INT_TOKENS: [(&str, Option<i64>); 7] = [
+        ("1800000000.00000000000000001", None),
+        ("-9223372036854775809", None),
+        ("9223372036854775808", None),
+        ("-9.223372036854775809e18", None),
+        ("9.223372036854775808e18", None),
+        ("9.223372036854775807e18", Some(i64::MAX)),
+        ("-9.223372036854775808e18", Some(i64::MIN)),
+    ];
+
     /// xorshift64*: fixed seed, so a failing value is reproducible.
     fn next_u64(state: &mut u64) -> u64 {
         *state ^= *state >> 12;
@@ -534,8 +594,6 @@ mod tests {
             (serde_json::json!(1.8e9), 1_800_000_000),
             (serde_json::json!(i64::MAX), i64::MAX),
             (serde_json::json!(i64::MIN), i64::MIN),
-            // -2^63 is exact as a float and fits.
-            (serde_json::json!(i64::MIN as f64), i64::MIN),
         ] {
             assert_eq!(json_int(&v), Some(want), "{v}");
         }
@@ -567,6 +625,9 @@ mod tests {
             serde_json::json!((i64::MIN as f64).next_down()),
             serde_json::json!(i64::MAX as u64 + 1),
             serde_json::json!(u64::MAX),
+            // A Value made from a float holds its shortest decimal,
+            // -9.223372036854776e18, which is below i64::MIN.
+            serde_json::json!(i64::MIN as f64),
         ] {
             assert_eq!(json_int(&v), None, "{v}");
         }
@@ -575,18 +636,208 @@ mod tests {
         }
     }
 
-    /// serde_json (without `arbitrary_precision`) rounds a float literal to
-    /// f64 before json_int sees it, so a literal past f64 precision is judged
-    /// by its rounded value.
+    /// A number is judged by its exact decimal text, not the f64 it rounds
+    /// to: a fraction or a value past i64 that an f64 can't tell apart from
+    /// an int is `None`, and the bounds written with exponents are ints.
     #[test]
-    fn json_int_judges_the_decoded_float() {
+    fn json_int_judges_the_exact_decimal() {
         for (text, want) in [
-            ("300.00000000000001", Some(300)),
-            ("-9223372036854775809", Some(i64::MIN)),
-            ("9.223372036854775807e18", None),
+            ("1.0", Some(1)),
+            ("1e3", Some(1000)),
+            ("1E3", Some(1000)),
+            ("1e+3", Some(1000)),
+            ("300.000", Some(300)),
+            ("3000e-1", Some(300)),
+            ("0.003e5", Some(300)),
+            ("-0.0e7", Some(0)),
+            ("9.223372036854775807e18", Some(i64::MAX)),
+            ("-9.223372036854775808e18", Some(i64::MIN)),
+            ("92233720368547758070e-1", Some(i64::MAX)),
+            ("-0.9223372036854775808e19", Some(i64::MIN)),
+            ("300.00000000000001", None),
+            ("1800000000.00000000000000001", None),
+            ("-9223372036854775809", None),
+            ("9223372036854775808", None),
+            ("9.223372036854775808e18", None),
+            ("-9.223372036854775809e18", None),
+            ("9.2233720368547758071e18", None),
+            ("1e19", None),
+            ("1e-1", None),
         ] {
             assert_eq!(json_int(&serde_json::from_str(text).unwrap()), want, "{text}");
         }
+    }
+
+    /// Exponents far past any int stay cheap: no allocation or loop grows
+    /// with the exponent's value, and saturating it keeps the outcome exact.
+    #[test]
+    fn json_int_handles_huge_exponents_promptly() {
+        let got = promptly(|| {
+            let huge = "9".repeat(1_000_000);
+            let zeros = "0".repeat(1_000_000);
+            [
+                "1e999999999".to_string(),
+                "-1e999999999".to_string(),
+                "1e-999999999".to_string(),
+                "0e999999999".to_string(),
+                "1e99999999999999999999999999999".to_string(),
+                "1e-99999999999999999999999999999".to_string(),
+                "0.0e-99999999999999999999999999999".to_string(),
+                format!("1e{huge}"),
+                format!("1e-{huge}"),
+                // A million trailing zeros and an exponent that takes them back.
+                format!("1{zeros}e-1000000"),
+                format!("-0.{zeros}5e1000001"),
+                format!("1{zeros}e-999980"),
+            ]
+            .map(|text| json_int(&serde_json::from_str(&text).unwrap()))
+        });
+        assert_eq!(got, [None, None, None, Some(0), None, None, Some(0), None, None, Some(1), Some(-5), None]);
+    }
+
+    /// What the JSON number `token` denotes, worked out on digit strings by
+    /// moving the decimal point: the oracle for json_int. `Some` holds the
+    /// int's decimal text when the token is a whole number within i64.
+    fn int_oracle(token: &str) -> Option<String> {
+        let (negative, rest) = token.strip_prefix('-').map_or((false, token), |r| (true, r));
+        let (mantissa, exponent) = rest.split_once(['e', 'E']).unwrap_or((rest, "0"));
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = format!("{int}{frac}");
+        assert!(digits.len() < 1000, "the oracle reads exponents for short mantissas only: {token}");
+        let exponent = exponent.strip_prefix('+').unwrap_or(exponent);
+        let (exp_negative, exp_digits) = exponent.strip_prefix('-').map_or((false, exponent), |e| (true, e));
+        let exp_digits = exp_digits.trim_start_matches('0');
+        if digits.bytes().all(|d| d == b'0') {
+            return Some("0".into());
+        }
+        // A nonzero mantissa of under 1000 digits times 10^±10000 or more is
+        // far past i64, or a nonzero value far below 1.
+        if exp_digits.len() > 4 {
+            return None;
+        }
+        let exp: i32 = exp_digits.parse().unwrap_or(0);
+        let point = int.len() as i32 + if exp_negative { -exp } else { exp };
+        let (whole, fraction) = if point <= 0 {
+            (String::new(), format!("{}{digits}", "0".repeat(-point as usize)))
+        } else if point as usize >= digits.len() {
+            (format!("{digits}{}", "0".repeat(point as usize - digits.len())), String::new())
+        } else {
+            (digits[..point as usize].to_string(), digits[point as usize..].to_string())
+        };
+        if !fraction.bytes().all(|d| d == b'0') {
+            return None;
+        }
+        let whole = whole.trim_start_matches('0');
+        if whole.is_empty() {
+            return Some("0".into());
+        }
+        let bound = if negative { "9223372036854775808" } else { "9223372036854775807" };
+        (whole.len() < bound.len() || (whole.len() == bound.len() && whole <= bound))
+            .then(|| format!("{}{whole}", if negative { "-" } else { "" }))
+    }
+
+    /// Over generated JSON number tokens (random digits, the i64 bounds with
+    /// the decimal point moved and the exponent making up for it or missing
+    /// by one, rounded fractions, huge exponents, and the decimals floats
+    /// print as), json_int agrees with int_oracle.
+    #[test]
+    fn json_int_agrees_with_a_digit_string_oracle() {
+        const BOUNDS: [&str; 6] = [
+            "9223372036854775807",
+            "9223372036854775808",
+            "9223372036854775806",
+            "9223372036854775809",
+            "1800000000",
+            "300",
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let mut rand = |n: u64| next_u64(&mut state) % n;
+        // A third of the digits are zeros, so runs of them come up.
+        fn random_digits(len: u64, rand: &mut impl FnMut(u64) -> u64) -> String {
+            (0..len).map(|_| if rand(3) == 0 { '0' } else { char::from(b'0' + rand(10) as u8) }).collect()
+        }
+        let (mut accepted, mut rejected, mut max_seen, mut min_seen) = (0, 0, false, false);
+        for i in 0..200_000 {
+            let negative = rand(2) == 0;
+            let token = if i % 5 == 4 {
+                // The decimal a float prints as.
+                let f = f64::from_bits(rand(u64::MAX)) * if rand(2) == 0 { 1.0 } else { 1e-300 };
+                let f = if rand(2) == 0 { f } else { f.trunc() };
+                match serde_json::Value::from(f) {
+                    serde_json::Value::Number(n) => n.as_str().to_string(),
+                    _ => continue,
+                }
+            } else if i % 5 < 2 {
+                // A bound's digits with the point moved and the exponent making up for it.
+                let bound = if rand(3) == 0 {
+                    format!("{}{}", 1 + rand(9), random_digits(rand(22), &mut rand))
+                } else {
+                    BOUNDS[rand(BOUNDS.len() as u64) as usize].to_string()
+                };
+                let k = rand(bound.len() as u64 + 1) as usize;
+                let leading = rand(4) as usize;
+                let (mut mantissa, mut exp) = if k == 0 {
+                    (format!("0.{}{bound}", "0".repeat(leading)), (leading + bound.len()) as i64)
+                } else if k == bound.len() {
+                    (bound.clone(), 0)
+                } else {
+                    (format!("{}.{}", &bound[..k], &bound[k..]), (bound.len() - k) as i64)
+                };
+                if rand(2) == 0 {
+                    // Trailing zeros, which change nothing.
+                    let zeros = "0".repeat(1 + rand(20) as usize);
+                    mantissa = if mantissa.contains('.') { mantissa + &zeros } else { format!("{mantissa}.{zeros}") };
+                }
+                if rand(4) == 0 {
+                    // A rounded fraction: a 1 past what an f64 keeps.
+                    let sep = if mantissa.contains('.') { "" } else { "." };
+                    mantissa = format!("{mantissa}{sep}{}1", "0".repeat(rand(25) as usize));
+                }
+                exp += [-1, 0, 0, 0, 1][rand(5) as usize];
+                if exp == 0 && rand(2) == 0 { mantissa } else { format!("{mantissa}e{exp}") }
+            } else {
+                // Random digits, a fraction, and an exponent small or huge.
+                let int = if rand(4) == 0 {
+                    "0".to_string()
+                } else {
+                    format!("{}{}", 1 + rand(9), random_digits(rand(25), &mut rand))
+                };
+                let frac = if rand(2) == 0 {
+                    String::new()
+                } else {
+                    format!(".{}{}", random_digits(1 + rand(25), &mut rand), "0".repeat(rand(5) as usize))
+                };
+                let exp = match rand(6) {
+                    0 => String::new(),
+                    1 => format!(
+                        "e{}",
+                        ["999999999999999999999", "18446744073709551616", "100000", "0000"][rand(4) as usize]
+                    ),
+                    _ => format!("e{}", rand(61) as i64 - 30),
+                };
+                let exp = match (exp.strip_prefix('e'), rand(4)) {
+                    (Some(e), 0) if !e.starts_with('-') => format!("E+{e}"),
+                    (Some(e), 1) if !e.starts_with('-') && rand(2) == 0 => format!("e-{e}"),
+                    _ => exp,
+                };
+                format!("{int}{frac}{exp}")
+            };
+            let token = if negative && !token.starts_with('-') { format!("-{token}") } else { token };
+            let value: serde_json::Value = serde_json::from_str(&token).unwrap_or_else(|e| panic!("{token}: {e}"));
+            let got = json_int(&value);
+            assert_eq!(got.map(|n| n.to_string()), int_oracle(&token), "{token}");
+            match got {
+                Some(n) => {
+                    accepted += 1;
+                    max_seen |= n == i64::MAX;
+                    min_seen |= n == i64::MIN;
+                }
+                None => rejected += 1,
+            }
+        }
+        // The generator reaches both outcomes and both bounds.
+        assert!(accepted > 10_000 && rejected > 10_000, "{accepted} accepted, {rejected} rejected");
+        assert!(max_seen && min_seen, "max {max_seen}, min {min_seen}");
     }
 
     #[test]
@@ -623,9 +874,9 @@ mod tests {
         }
     }
 
-    /// Over edge and random floats, json_int keeps exactly the finite whole
-    /// values in the i64 range (checked against a naive i128 oracle), and the
-    /// int it gives is that value.
+    /// Over edge and random floats, written as their exact decimal, json_int
+    /// keeps exactly the finite whole values in the i64 range (checked against
+    /// a naive i128 oracle), and the int it gives is that value.
     #[test]
     fn json_int_keeps_exactly_whole_floats_in_range() {
         const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -677,8 +928,15 @@ mod tests {
         for f in values {
             // `as i128` saturates only far outside the i64 range.
             let fits = f.is_finite() && f.trunc() == f && (i64::MIN as i128..=i64::MAX as i128).contains(&(f as i128));
-            // A non-finite float becomes JSON null.
-            let got = json_int(&serde_json::Value::from(f));
+            // A whole float's exact decimal; a Value made from any other
+            // float holds its shortest decimal, which keeps a fraction, or
+            // null for a non-finite one.
+            let value = if f.is_finite() && f.trunc() == f {
+                serde_json::from_str(&format!("{f:.0}")).unwrap()
+            } else {
+                serde_json::Value::from(f)
+            };
+            let got = json_int(&value);
             assert_eq!(got.is_some(), fits, "{f:e}");
             if let Some(n) = got {
                 assert_eq!(n as f64, f, "{f:e}");
