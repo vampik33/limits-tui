@@ -1,3 +1,4 @@
+mod child;
 pub mod claude;
 pub mod codex;
 pub mod devin;
