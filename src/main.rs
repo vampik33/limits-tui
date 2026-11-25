@@ -156,15 +156,18 @@ fn refresh_due(app: &mut App, tx: &mpsc::Sender<FetchMsg>, manual: bool) {
     }
 }
 
-fn next_wakeup(app: &App) -> Instant {
-    [app.claude.next_at, app.codex.next_at, app.devin.next_at].into_iter().min().unwrap()
+/// The next fetch due from a source that isn't busy. A busy source can't
+/// refetch until its probe ends, however long that takes, so its `next_at`
+/// must not pin the wakeup; `poll_wait`'s PROBE_CHECK cap picks up the result.
+fn next_wakeup(app: &App) -> Option<Instant> {
+    [&app.claude, &app.codex, &app.devin].into_iter().filter(|s| !s.busy).map(|s| s.next_at).min()
 }
 
 /// How long to wait for a key: until the next due fetch, but at most 1 s (for
 /// the countdown text), or PROBE_CHECK while a probe runs; at least 10 ms.
 fn poll_wait(app: &App, now: Instant) -> Duration {
     let cap = if app.codex.busy || app.devin.busy { PROBE_CHECK } else { Duration::from_secs(1) };
-    next_wakeup(app).saturating_duration_since(now).min(cap).max(Duration::from_millis(10))
+    next_wakeup(app).map_or(cap, |at| at.saturating_duration_since(now).min(cap)).max(Duration::from_millis(10))
 }
 
 /// One non-interactive snapshot for `--once` / unscripted checks (and for
@@ -319,6 +322,55 @@ mod tests {
         assert_eq!(poll_wait(&app, now), Duration::from_millis(40));
         app.claude.next_at = now - Duration::from_secs(1);
         assert_eq!(poll_wait(&app, now), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn busy_overdue_source_does_not_pin_the_wakeup() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        // A probe that outran PROBE_POLL (a timeout above 300 s): its next_at has passed.
+        app.codex.busy = true;
+        app.codex.next_at = now - Duration::from_secs(1);
+        assert_eq!(next_wakeup(&app), Some(now + Duration::from_secs(60)));
+        assert_eq!(poll_wait(&app, now), PROBE_CHECK, "must not spin at the 10 ms floor");
+        // Once the probe's result is applied, its next fetch counts again.
+        app.codex.apply(window_resetting_at(unix_now() + 30));
+        assert!(!app.codex.busy);
+        assert_eq!(next_wakeup(&app), Some(app.codex.next_at));
+    }
+
+    #[test]
+    fn busy_source_due_soon_does_not_shorten_the_probe_check() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        app.devin.busy = true;
+        app.devin.next_at = now + Duration::from_millis(40);
+        assert_eq!(poll_wait(&app, now), PROBE_CHECK);
+    }
+
+    #[test]
+    fn idle_overdue_source_still_wakes_at_once_beside_a_busy_one() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        app.codex.busy = true;
+        app.codex.next_at = now - Duration::from_secs(1);
+        app.devin.next_at = now - Duration::from_secs(1);
+        assert_eq!(next_wakeup(&app), Some(app.devin.next_at));
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(10));
+        app.devin.next_at = now + Duration::from_millis(40);
+        assert_eq!(poll_wait(&app, now), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn all_sources_busy_waits_probe_check() {
+        let now = Instant::now();
+        let mut app = app_at(now);
+        for s in [&mut app.claude, &mut app.codex, &mut app.devin] {
+            s.busy = true;
+            s.next_at = now - Duration::from_secs(1);
+        }
+        assert_eq!(next_wakeup(&app), None);
+        assert_eq!(poll_wait(&app, now), PROBE_CHECK);
     }
 
     fn ok(plan: Option<&str>, overage_micros: Option<i64>) -> ProbeResult {
