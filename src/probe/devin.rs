@@ -821,9 +821,10 @@ mod tests {
     #[test]
     fn extreme_remaining_percent_is_clamped_without_overflow() {
         for (remaining, used) in [
-            (serde_json::json!(-1e300), 100.0),
+            (serde_json::json!(i64::MIN), 100.0),
             (serde_json::json!("-9223372036854775808"), 100.0),
-            (serde_json::json!(1e300), 0.0),
+            (serde_json::json!(i64::MAX), 0.0),
+            (serde_json::json!(-1e18), 100.0),
             (serde_json::json!(-20), 100.0),
         ] {
             let mut p = payload(None);
@@ -848,8 +849,21 @@ mod tests {
 
     #[test]
     fn unreadable_remaining_percent_is_an_error() {
-        let bad =
-            [serde_json::json!("NaN"), "inf".into(), "-inf".into(), "abc".into(), true.into(), serde_json::json!({})];
+        let bad = [
+            serde_json::json!("NaN"),
+            "inf".into(),
+            "-inf".into(),
+            "abc".into(),
+            true.into(),
+            serde_json::json!({}),
+            serde_json::json!(0.5),
+            serde_json::json!(-0.5),
+            serde_json::json!(70.5),
+            serde_json::json!(1e30),
+            serde_json::json!(-1e30),
+            serde_json::json!(1e300),
+            serde_json::json!(-1e300),
+        ];
         for (field, reset_field) in [
             ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix"),
             ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix"),
@@ -880,7 +894,15 @@ mod tests {
 
     #[test]
     fn invalid_overage_is_still_an_error() {
-        for bad in [serde_json::json!("lots"), serde_json::json!(true), serde_json::json!({})] {
+        for bad in [
+            serde_json::json!("lots"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!(0.5),
+            serde_json::json!(-0.5),
+            serde_json::json!(1e30),
+            serde_json::json!(-1e30),
+        ] {
             let err = normalize(&payload(Some(bad.clone())), "key").err().expect("should fail");
             assert_eq!(err.code, ErrorCode::Failed, "{bad}");
             assert!(err.detail.contains("overage"), "{bad}: {}", err.detail);
@@ -893,6 +915,19 @@ mod tests {
         p["userStatus"]["planStatus"]["weeklyQuotaRemainingPercent"] = 40.into();
         p["userStatus"]["planStatus"]["weeklyQuotaResetAtUnix"] = 1_800_500_000.into();
         p
+    }
+
+    #[test]
+    fn whole_floats_are_read_as_ints() {
+        let mut p = two_window_payload();
+        let status = &mut p["userStatus"]["planStatus"];
+        status["dailyQuotaResetAtUnix"] = 1_800_000_000.0.into();
+        status["dailyQuotaRemainingPercent"] = 70.0.into();
+        status["overageBalanceMicros"] = 2_500_000.0.into();
+        let d = normalize(&p, "key").unwrap();
+        let windows: Vec<_> = d.windows.iter().map(|w| (w.label, w.used_percent, w.resets_at)).collect();
+        assert_eq!(windows, [("day", 30.0, 1_800_000_000), ("wk", 60.0, 1_800_500_000)]);
+        assert_eq!(d.overage_micros, Some(2_500_000));
     }
 
     #[test]
@@ -945,8 +980,9 @@ mod tests {
     }
 
     /// Present reset times that no reply should carry: unparsable or
-    /// non-finite strings, wrong JSON types and negative times.
-    fn unreadable_resets() -> [serde_json::Value; 11] {
+    /// non-finite strings, wrong JSON types, negative times, and numbers that
+    /// aren't a whole i64.
+    fn unreadable_resets() -> [serde_json::Value; 16] {
         [
             serde_json::json!("abc"),
             "".into(),
@@ -959,6 +995,11 @@ mod tests {
             serde_json::json!([1_800_000_000]),
             serde_json::json!(-1),
             "-1800000000".into(),
+            serde_json::json!(0.5),
+            serde_json::json!(-0.5),
+            serde_json::json!(1_800_000_000.5),
+            serde_json::json!(1e30),
+            serde_json::json!(-1e30),
         ]
     }
 

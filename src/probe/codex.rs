@@ -1182,6 +1182,46 @@ mod tests {
     }
 
     #[test]
+    fn normalize_fractional_or_huge_window_number_is_failed() {
+        for (field, bad) in [
+            ("windowDurationMins", serde_json::json!(0.5)),
+            ("windowDurationMins", serde_json::json!(300.5)),
+            ("windowDurationMins", serde_json::json!(1e30)),
+            ("resetsAt", serde_json::json!(0.5)),
+            ("resetsAt", serde_json::json!(-0.5)),
+            ("resetsAt", serde_json::json!(1_800_000_000.5)),
+            ("resetsAt", serde_json::json!(1e30)),
+            ("resetsAt", serde_json::json!(-1e30)),
+        ] {
+            let mut w = window(300);
+            w[field] = bad.clone();
+            let err = normalize(&serde_json::json!({"rateLimits": {"primary": w}})).err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{field}: {bad}");
+            assert!(err.detail.contains("unrecognized format"), "{field}: {bad}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_known_window_next_to_fractional_one() {
+        let mut bad = window(300);
+        bad["resetsAt"] = serde_json::json!(0.5);
+        let d = normalize(&serde_json::json!({"rateLimits": {"primary": bad, "secondary": window(10080)}})).unwrap();
+        let labels: Vec<_> = d.windows.iter().map(|w| w.label).collect();
+        assert_eq!(labels, ["wk"]);
+    }
+
+    #[test]
+    fn normalize_reads_whole_float_window_numbers() {
+        let d = normalize(&serde_json::json!({"rateLimits": {
+            "primary": {"windowDurationMins": 300.0, "usedPercent": 12.5, "resetsAt": 1_800_000_000.0},
+            "secondary": {"windowDurationMins": 10080.0, "usedPercent": 40, "resetsAt": 1_800_500_000.0},
+        }}))
+        .unwrap();
+        let windows: Vec<_> = d.windows.iter().map(|w| (w.label, w.resets_at)).collect();
+        assert_eq!(windows, [("5h", 1_800_000_000), ("wk", 1_800_500_000)]);
+    }
+
+    #[test]
     fn normalize_without_rate_limits_object_is_failed() {
         for result in [
             serde_json::json!({}),
