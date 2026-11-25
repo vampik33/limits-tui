@@ -160,7 +160,13 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else {
             continue;
         };
-        let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0).clamp(0, 100);
+        // Connect's JSON omits zero-valued fields, so a missing percentage is 0% remaining.
+        let remaining = match plan_status.get(remaining_field) {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => json_int(v)
+                .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "API response has an invalid quota percentage"))?,
+        }
+        .clamp(0, 100);
         let used = (100 - remaining) as f64;
         windows.extend(UsageWindow::new(label, used, reset));
     }
@@ -293,11 +299,39 @@ mod tests {
             p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.clone();
             assert_eq!(normalize(&p, "key").unwrap().windows[0].used_percent, used, "{remaining}");
         }
-        for remaining in ["NaN", "inf", "-inf"] {
+    }
+
+    #[test]
+    fn unreadable_remaining_percent_is_an_error() {
+        for (field, reset_field, remaining) in [
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("NaN")),
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("inf")),
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("-inf")),
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("abc")),
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!(true)),
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!({})),
+            ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", serde_json::json!("NaN")),
+            ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", serde_json::json!("abc")),
+        ] {
             let mut p = payload(None);
-            p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.into();
-            let used = normalize(&p, "key").unwrap().windows[0].used_percent;
-            assert!(used.is_finite() && (0.0..=100.0).contains(&used), "{remaining}: {used}");
+            p["userStatus"]["planStatus"][reset_field] = "1800000000".into();
+            p["userStatus"]["planStatus"][field] = remaining.clone();
+            let err = normalize(&p, "key").err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{field}: {remaining}");
+            assert!(err.detail.contains("quota percentage"), "{field}: {remaining}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn absent_or_null_remaining_percent_is_fully_used() {
+        for remaining in [None, Some(serde_json::Value::Null)] {
+            let mut p = payload(None);
+            let status = p["userStatus"]["planStatus"].as_object_mut().unwrap();
+            status.remove("dailyQuotaRemainingPercent");
+            if let Some(v) = remaining.clone() {
+                status.insert("dailyQuotaRemainingPercent".into(), v);
+            }
+            assert_eq!(normalize(&p, "key").unwrap().windows[0].used_percent, 100.0, "{remaining:?}");
         }
     }
 
