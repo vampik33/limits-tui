@@ -106,10 +106,20 @@ pub fn unix_now() -> i64 {
 }
 
 /// Loose integer parse like the Python probes: real ints, or numeric strings
-/// (the devin API mixes both).
+/// (the devin API mixes both). A number must be a whole value in the i64
+/// range (`1.0` is 1); a fraction like `0.5` or a huge value like `1e30`
+/// is `None`, so the caller reports it instead of reading a plausible int.
+/// The check sees the number as serde_json decoded it: a literal past f64
+/// precision is judged after rounding, so `300.00000000000001` reads as 300
+/// and `9.223372036854775807e18` (2^63 as a float) is `None`.
 pub fn json_int(v: &serde_json::Value) -> Option<i64> {
+    // 2^63: i64::MIN as f64 is -2^63 exactly, but i64::MAX as f64 rounds up to 2^63, which doesn't fit.
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
     match v {
-        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| {
+            let f = n.as_f64()?;
+            (f.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&f)).then_some(f as i64)
+        }),
         serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
     }
@@ -478,6 +488,172 @@ mod tests {
             }
             // The TUI label (`round() as i64`) and `--once` (`round()` printed) agree.
             assert_eq!(p.round().to_string(), (p.round() as i64).to_string(), "{pct:e}");
+        }
+    }
+
+    // --- json_int ---
+
+    #[test]
+    fn json_int_reads_whole_numbers() {
+        for (v, want) in [
+            (serde_json::json!(0), 0),
+            (serde_json::json!(-1), -1),
+            (serde_json::json!(1.0), 1),
+            (serde_json::json!(-1.0), -1),
+            (serde_json::json!(-0.0), 0),
+            (serde_json::json!(1.8e9), 1_800_000_000),
+            (serde_json::json!(i64::MAX), i64::MAX),
+            (serde_json::json!(i64::MIN), i64::MIN),
+            // -2^63 is exact as a float and fits.
+            (serde_json::json!(i64::MIN as f64), i64::MIN),
+        ] {
+            assert_eq!(json_int(&v), Some(want), "{v}");
+        }
+        for (text, want) in [
+            ("1.0", 1),
+            ("-1.0", -1),
+            ("-0", 0),
+            ("1800000000.0", 1_800_000_000),
+            ("-9.223372036854775808e18", i64::MIN),
+        ] {
+            assert_eq!(json_int(&serde_json::from_str(text).unwrap()), Some(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn json_int_rejects_fractions_and_out_of_range_numbers() {
+        for v in [
+            serde_json::json!(0.5),
+            serde_json::json!(-0.5),
+            serde_json::json!(1_800_000_000.5),
+            serde_json::json!(5e-324),
+            serde_json::json!(1e30),
+            serde_json::json!(-1e30),
+            serde_json::json!(f64::MAX),
+            serde_json::json!(f64::MIN),
+            // 2^63, and i64::MAX written as a float, which rounds to 2^63.
+            serde_json::json!(9_223_372_036_854_775_808.0),
+            serde_json::json!(i64::MAX as f64),
+            serde_json::json!((i64::MIN as f64).next_down()),
+            serde_json::json!(i64::MAX as u64 + 1),
+            serde_json::json!(u64::MAX),
+        ] {
+            assert_eq!(json_int(&v), None, "{v}");
+        }
+        for text in ["0.5", "-0.5", "1e30", "-1e30", "9223372036854775808", "18446744073709551615"] {
+            assert_eq!(json_int(&serde_json::from_str(text).unwrap()), None, "{text}");
+        }
+    }
+
+    /// serde_json (without `arbitrary_precision`) rounds a float literal to
+    /// f64 before json_int sees it, so a literal past f64 precision is judged
+    /// by its rounded value.
+    #[test]
+    fn json_int_judges_the_decoded_float() {
+        for (text, want) in [
+            ("300.00000000000001", Some(300)),
+            ("-9223372036854775809", Some(i64::MIN)),
+            ("9.223372036854775807e18", None),
+        ] {
+            assert_eq!(json_int(&serde_json::from_str(text).unwrap()), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn json_int_reads_only_integer_strings() {
+        for (s, want) in [
+            ("0", 0),
+            ("-1", -1),
+            (" 42 ", 42),
+            ("1800000000", 1_800_000_000),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+        ] {
+            assert_eq!(json_int(&s.into()), Some(want), "{s:?}");
+        }
+        for s in [
+            "0.5",
+            "-0.5",
+            "1.0",
+            "1e30",
+            "-1e30",
+            "1e3",
+            "NaN",
+            "inf",
+            "-inf",
+            "infinity",
+            "9223372036854775808",
+            "",
+            "abc",
+        ] {
+            assert_eq!(json_int(&s.into()), None, "{s:?}");
+        }
+        for v in [serde_json::Value::Null, true.into(), serde_json::json!({}), serde_json::json!([1])] {
+            assert_eq!(json_int(&v), None, "{v}");
+        }
+    }
+
+    /// Over edge and random floats, json_int keeps exactly the finite whole
+    /// values in the i64 range (checked against a naive i128 oracle), and the
+    /// int it gives is that value.
+    #[test]
+    fn json_int_keeps_exactly_whole_floats_in_range() {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        let mut values = vec![
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1e30,
+            -1e30,
+            TWO_POW_63,
+            -TWO_POW_63,
+            i64::MAX as f64,
+            f64::MAX,
+            f64::MIN,
+            f64::EPSILON,
+            f64::MIN_POSITIVE,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for edge in [0.0f64, 1.0, -1.0, 4_503_599_627_370_496.0, 9_007_199_254_740_992.0, TWO_POW_63, -TWO_POW_63] {
+            values.extend([edge.next_up(), edge.next_down(), -edge.next_up(), -edge.next_down()]);
+        }
+        // Subnormals, NaN payloads (quiet, signalling, negative), the largest finite.
+        for bits in [
+            1u64,
+            0x000F_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0001,
+            0x7FF0_0000_0000_0001,
+            0x7FF8_0000_0000_0001,
+            0xFFF8_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x7FEF_FFFF_FFFF_FFFF,
+        ] {
+            values.push(f64::from_bits(bits));
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..100_000 {
+            // Any bit pattern; a whole value inside the range, then one that
+            // is past it half the time; a value with a fraction.
+            values.push(f64::from_bits(next_u64(&mut state)));
+            values.push(next_u64(&mut state) as i64 as f64);
+            values.push(next_u64(&mut state) as i64 as f64 * 2.0);
+            values.push((next_u64(&mut state) as i64 >> 11) as f64 / 1024.0);
+        }
+        for f in values {
+            // `as i128` saturates only far outside the i64 range.
+            let fits = f.is_finite() && f.trunc() == f && (i64::MIN as i128..=i64::MAX as i128).contains(&(f as i128));
+            // A non-finite float becomes JSON null.
+            let got = json_int(&serde_json::Value::from(f));
+            assert_eq!(got.is_some(), fits, "{f:e}");
+            if let Some(n) = got {
+                assert_eq!(n as f64, f, "{f:e}");
+                assert_eq!(n as i128, f as i128, "{f:e}");
+            }
         }
     }
 
