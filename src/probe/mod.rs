@@ -250,6 +250,28 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5)).expect("blocked for more than 5 s")
     }
 
+    /// A fresh sleep argument to find a test's processes by: GNU sleep adds its
+    /// arguments, so the fraction changes nothing.
+    pub(super) fn sleep_token(test: &str) -> String {
+        use std::hash::BuildHasher;
+        let random = std::collections::hash_map::RandomState::new().hash_one(test) % 1_000_000_000;
+        format!("0.000{random:09}")
+    }
+
+    /// Pids of live (not zombie) processes whose command line has `token`.
+    pub(super) fn live_with(token: &str) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+        dir.filter_map(|e| e.ok())
+            .filter(|e| {
+                let path = e.path();
+                let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
+                let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+                String::from_utf8_lossy(&cmdline).contains(token) && !stat.contains(") Z ")
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn small_file_is_read() {
         let scratch = Scratch::new("readok");

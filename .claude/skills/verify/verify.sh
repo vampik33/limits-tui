@@ -95,6 +95,16 @@ dead_status() {
   echo unknown
 }
 
+# Waits up to 5 s for the pane's app to exit.
+wait_pane_dead() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    [ "$(pane '#{pane_dead}')" = 1 ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 # Waits until the pane shows every pattern given (fixed strings), up to 20 s.
 wait_for_screen() { # $1 = capture file, rest = patterns
   local file="$1" i p missing
@@ -128,7 +138,7 @@ once() {
 }
 
 tui() {
-  local log="$out/tui.log" t0=$SECONDS i status q
+  local log="$out/tui.log" t0=$SECONDS status q
   : >"$log"
   sockdir=$(mktemp -d "${TMPDIR:-/tmp}/limits-tui.XXXXXXXX" 2>>"$log") || fail tui "$log" "mktemp -d failed"
   sock="$sockdir/sock"
@@ -147,11 +157,7 @@ tui() {
   wait_for_screen "$out/screen-refresh.txt" "limits" "Claude" "Codex" "Devin" "q quit" >>"$log" ||
     fail tui "$log" "frame broken after r"
   tmux -S "$sock" send-keys -t v q
-  for ((i = 0; i < 20; i++)); do
-    [ "$(pane '#{pane_dead}')" = 1 ] && break
-    sleep 0.25
-  done
-  [ "$(pane '#{pane_dead}')" = 1 ] || fail tui "$log" "still running 5 s after q"
+  wait_pane_dead || fail tui "$log" "still running 5 s after q"
   tmux -S "$sock" capture-pane -p -t v >"$out/screen-exit.txt" 2>/dev/null || true
   status=$(dead_status)
   if [ "$status" != 0 ]; then
@@ -170,6 +176,9 @@ alive_in_group() {
   read -r -a fields <<<"${stat##*) }" # "pid (comm) state ppid pgrp ...": comm may hold anything
   [ "${fields[0]}" != Z ] && [ "${fields[2]}" = "$2" ]
 }
+
+# Whether $1 is a pid that may be signalled: numeric, and neither 0 nor 1.
+valid_pid() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && [ "$1" -gt 1 ]; }
 
 # Quitting must kill the children of probes still running: their threads die with the app. A fake
 # codex that never answers starts a background job in its group and records both pids; once q has
@@ -201,18 +210,12 @@ EOF
   [ -s "$pids" ] || fail quit-kills "$log" "the fake codex never started (no $pids after 20 s)"
   read -r leader job <"$pids"
   echo "fake codex: group leader $leader, background job $job" >>"$log"
-  if ! [[ $leader =~ ^[1-9][0-9]{0,8}$ ]] || [ "$leader" -le 1 ]; then
-    fail quit-kills "$log" "bad group leader pid '$leader' in $pids"
-  fi
-  if ! [[ $job =~ ^[1-9][0-9]{0,8}$ ]] || [ "$job" -le 1 ]; then qk_fail "bad job pid '$job' in $pids"; fi
+  valid_pid "$leader" || fail quit-kills "$log" "bad group leader pid '$leader' in $pids"
+  valid_pid "$job" || qk_fail "bad job pid '$job' in $pids"
   wait_for_screen "$out/screen-quit-kills.txt" "limits" "Claude" "Codex" "Devin" "q quit" >>"$log" ||
     qk_fail "first frame incomplete"
   tmux -S "$sock" send-keys -t v q
-  for ((i = 0; i < 20; i++)); do
-    [ "$(pane '#{pane_dead}')" = 1 ] && break
-    sleep 0.25
-  done
-  [ "$(pane '#{pane_dead}')" = 1 ] || qk_fail "still running 5 s after q"
+  wait_pane_dead || qk_fail "still running 5 s after q"
   status=$(dead_status)
   [ "$status" = 0 ] || qk_fail "exit status $status after q"
   for ((i = 0; i < 30; i++)); do

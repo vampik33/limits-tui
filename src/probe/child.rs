@@ -140,8 +140,12 @@ impl BoundedOutput {
 /// reaped. The lock is never held across a spawn (fork and exec, which can
 /// stall on a hung mount) or a wait on a child or its output, so one probe's
 /// spawn never waits for another's, and `kill_all` waits at most SPAWN_WAIT,
-/// for spawns in flight. The condvar signals the end of a spawn.
-pub(super) struct Children(Mutex<Groups>, Condvar);
+/// for spawns in flight.
+pub(super) struct Children {
+    groups: Mutex<Groups>,
+    /// Signalled at the end of each spawn, for `kill_all` to stop waiting.
+    spawn_done: Condvar,
+}
 
 struct Groups {
     /// Group ids: the pids of children spawned with `process_group(0)` and not
@@ -155,7 +159,7 @@ struct Groups {
 
 impl Children {
     const fn new() -> Self {
-        Self(Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }), Condvar::new())
+        Self { groups: Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }), spawn_done: Condvar::new() }
     }
 
     /// Spawn `cmd`, which must set `process_group(0)`, and record its group.
@@ -177,7 +181,7 @@ impl Children {
         let spawned = cmd.spawn();
         let mut groups = self.lock();
         groups.spawning -= 1;
-        self.1.notify_all();
+        self.spawn_done.notify_all();
         let child = spawned?;
         let group = child.id() as libc::pid_t;
         groups.live.push(group);
@@ -217,7 +221,7 @@ impl Children {
             }
             // Not wait_timeout_while: its `?` would end the wait on a
             // poisoned lock.
-            groups = self.1.wait_timeout(groups, left).unwrap_or_else(PoisonError::into_inner).0;
+            groups = self.spawn_done.wait_timeout(groups, left).unwrap_or_else(PoisonError::into_inner).0;
         }
         for &group in &groups.live {
             // SAFETY: killpg only sends a signal. `group` is the pid of a
@@ -233,7 +237,7 @@ impl Children {
     /// The lock, even if a thread panicked holding it: `live`, `closed` and
     /// `spawning` are each changed in one step, and quitting must still kill.
     fn lock(&self) -> MutexGuard<'_, Groups> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.groups.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -314,6 +318,7 @@ mod tests {
 
     use std::sync::mpsc;
 
+    use crate::probe::tests::{live_with, sleep_token};
     use crate::probe::{SCRIPTS, wait_until};
 
     fn sh(script: &str) -> Command {
@@ -390,11 +395,11 @@ mod tests {
     fn kill_all_still_kills_after_a_panic_poisoned_the_lock() {
         static CHILDREN: Children = Children::new();
         let _ = std::thread::spawn(|| {
-            let _held = CHILDREN.0.lock();
+            let _held = CHILDREN.groups.lock();
             panic!("a probe thread panics holding the lock");
         })
         .join();
-        assert!(CHILDREN.0.is_poisoned());
+        assert!(CHILDREN.groups.is_poisoned());
         assert_kill_all_kills_a_running_group(&CHILDREN);
     }
 
@@ -486,10 +491,8 @@ mod tests {
 
     #[test]
     fn run_bounded_records_its_child_in_children() {
-        use std::hash::BuildHasher;
         // A fresh sleep argument to find the child by.
-        let random = std::collections::hash_map::RandomState::new().hash_one("record") % 1_000_000_000;
-        let token = format!("0.000{random:09}");
+        let token = sleep_token("record");
         let (tx, rx) = mpsc::channel();
         let mut cmd = sh(&format!("exec sleep 30 {token}"));
         std::thread::spawn(move || {
@@ -498,12 +501,7 @@ mod tests {
         });
         let mut pid = None;
         assert!(wait_until(40, || {
-            pid = std::fs::read_dir("/proc").ok().and_then(|dir| {
-                dir.filter_map(|e| e.ok()).find_map(|e| {
-                    let cmdline = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
-                    String::from_utf8_lossy(&cmdline).contains(&token).then(|| e.file_name().to_str()?.parse().ok())?
-                })
-            });
+            pid = live_with(&token).first().and_then(|p| p.parse().ok());
             pid.is_some()
         }));
         let pid: u32 = pid.unwrap();

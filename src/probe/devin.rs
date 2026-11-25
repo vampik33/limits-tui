@@ -371,7 +371,7 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
 mod tests {
     use super::*;
     use crate::probe::MAX_FILE_BYTES;
-    use crate::probe::tests::{Scratch, promptly};
+    use crate::probe::tests::{Scratch, live_with, promptly, sleep_token};
     use crate::probe::{SCRIPTS, wait_until};
     use ureq::config::IpFamily;
 
@@ -486,28 +486,6 @@ mod tests {
         };
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
         assert!(matches!(err, ureq::Error::Io(_)), "{err}");
-    }
-
-    /// A fresh sleep argument to find a test's processes by: GNU sleep adds its
-    /// arguments, so the fraction changes nothing.
-    fn sleep_token(test: &str) -> String {
-        use std::hash::BuildHasher;
-        let random = std::collections::hash_map::RandomState::new().hash_one(test) % 1_000_000_000;
-        format!("0.000{random:09}")
-    }
-
-    /// Pids of live (not zombie) processes whose command line has `token`.
-    fn live_with(token: &str) -> Vec<String> {
-        let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
-        dir.filter_map(|e| e.ok())
-            .filter(|e| {
-                let path = e.path();
-                let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
-                let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
-                String::from_utf8_lossy(&cmdline).contains(token) && !stat.contains(") Z ")
-            })
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect()
     }
 
     #[test]
