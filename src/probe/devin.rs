@@ -484,6 +484,17 @@ mod tests {
     }
 
     #[test]
+    fn lookup_job_that_released_stdout_is_killed() {
+        // The job sends its output elsewhere, so the child exits and stdout
+        // closes while the job still runs in the child's group.
+        let token = sleep_token("quiet");
+        let got = resolve(&format!("sleep 30 {token} >/dev/null 2>&1 &\necho 192.0.2.1:443")).unwrap();
+        assert_eq!(got, addrs(&["192.0.2.1:443"]));
+        let gone = wait_until(40, || live_with(&token).is_empty());
+        assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
+    }
+
+    #[test]
     fn addresses_printed_by_a_lookup_cut_off_at_the_deadline_time_out() {
         let resolver = sh_resolver("echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500));
         let start = Instant::now();
