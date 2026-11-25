@@ -242,6 +242,8 @@ fn main() -> std::io::Result<()> {
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal);
+    // Probes still running are on detached threads that die with us.
+    probe::kill_children();
     ratatui::restore();
     result
 }

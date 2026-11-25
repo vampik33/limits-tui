@@ -148,6 +148,13 @@ pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
     parse_timeout(std::env::var(var).ok().as_deref(), default_secs)
 }
 
+/// SIGKILL the process group of every child a probe still runs, and start no
+/// more. For quitting the TUI: its probe threads, which would kill them at
+/// their deadlines, die with the process. Doesn't wait for the probes.
+pub fn kill_children() {
+    child::CHILDREN.kill_all();
+}
+
 /// Unparsable values and NaN fall back to `default_secs`; the rest, infinity
 /// included, is clamped to 1 ms ..= MAX_TIMEOUT_SECS, so this never panics.
 fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {

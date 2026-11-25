@@ -240,8 +240,9 @@ fn resolve_with(
 
 /// Makes the child of `cmd` get SIGKILL when the thread that spawns it exits
 /// (Linux: PR_SET_PDEATHSIG). That thread waits in run_bounded until the child
-/// is reaped, so the signal only fires when the whole process goes, the TUI
-/// quitting mid-lookup; without it the child would run on to its own timeout.
+/// is reaped, so the signal only fires when the whole process goes without
+/// quitting (a quit kills the lookup's group first: kill_children), say on a
+/// signal; without it the child would run on to its own timeout.
 fn die_with_parent(cmd: &mut Command) {
     #[cfg(target_os = "linux")]
     {
