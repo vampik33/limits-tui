@@ -162,7 +162,7 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         };
         let remaining = json_int(&plan_status[remaining_field]).unwrap_or(0).clamp(0, 100);
         let used = (100 - remaining) as f64;
-        windows.push(UsageWindow { label, used_percent: used, resets_at: reset });
+        windows.extend(UsageWindow::new(label, used, reset));
     }
     if windows.is_empty() {
         return Err(ProbeError::new(ErrorCode::NoQuota, "no quota windows are available"));
@@ -278,6 +278,26 @@ mod tests {
             let mut p = payload(None);
             p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.clone();
             assert_eq!(normalize(&p, "key").unwrap().windows[0].used_percent, used, "{remaining}");
+        }
+    }
+
+    #[test]
+    fn remaining_percent_edge_values_give_a_percent_in_range() {
+        for (remaining, used) in [
+            (serde_json::json!(0), 100.0),
+            (serde_json::json!(100), 0.0),
+            (serde_json::json!(150), 0.0),
+            (serde_json::json!("70"), 30.0),
+        ] {
+            let mut p = payload(None);
+            p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.clone();
+            assert_eq!(normalize(&p, "key").unwrap().windows[0].used_percent, used, "{remaining}");
+        }
+        for remaining in ["NaN", "inf", "-inf"] {
+            let mut p = payload(None);
+            p["userStatus"]["planStatus"]["dailyQuotaRemainingPercent"] = remaining.into();
+            let used = normalize(&p, "key").unwrap().windows[0].used_percent;
+            assert!(used.is_finite() && (0.0..=100.0).contains(&used), "{remaining}: {used}");
         }
     }
 
