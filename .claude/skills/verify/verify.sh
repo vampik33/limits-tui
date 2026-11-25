@@ -145,8 +145,8 @@ tui() {
     sleep 0.25
   done
   [ "$(pane '#{pane_dead}')" = 1 ] || fail tui "$log" "still running 5 s after q"
-  status=$(dead_status) || fail tui "$log" "tmux recorded no exit status 2 s after q"
   tmux -S "$sock" capture-pane -p -t v >"$out/screen-exit.txt" 2>/dev/null || true
+  status=$(dead_status) || status=unknown
   if [ "$status" != 0 ]; then
     cat "$out/screen-exit.txt" >>"$log"
     fail tui "$log" "exit status $status after q"
