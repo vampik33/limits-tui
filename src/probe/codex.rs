@@ -393,7 +393,7 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
 mod tests {
     use super::*;
 
-    use crate::probe::SCRIPTS;
+    use crate::probe::{SCRIPTS, wait_until};
 
     /// Per-test temp dir, removed on drop.
     struct Scratch(std::path::PathBuf);
@@ -453,17 +453,6 @@ mod tests {
         let pid = std::fs::read_to_string(path).unwrap().trim().parse().unwrap();
         assert!(pid > 0, "bad pid {pid} in {}", path.display());
         pid
-    }
-
-    /// Whether `cond` holds within `tries` checks 50 ms apart.
-    fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
-        (0..tries).any(|_| {
-            let met = cond();
-            if !met {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            met
-        })
     }
 
     /// Whether `pid` is gone (or a zombie awaiting init) within about 2s.

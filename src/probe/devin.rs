@@ -338,7 +338,7 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probe::SCRIPTS;
+    use crate::probe::{SCRIPTS, wait_until};
     use ureq::config::IpFamily;
 
     // --- the lookup child and its resolver ---
@@ -432,6 +432,14 @@ mod tests {
         assert!(matches!(err, ureq::Error::Io(_)), "{err}");
     }
 
+    /// A fresh sleep argument to find a test's processes by: GNU sleep adds its
+    /// arguments, so the fraction changes nothing.
+    fn sleep_token(test: &str) -> String {
+        use std::hash::BuildHasher;
+        let random = std::collections::hash_map::RandomState::new().hash_one(test) % 1_000_000_000;
+        format!("0.000{random:09}")
+    }
+
     /// Pids of live (not zombie) processes whose command line has `token`.
     fn live_with(token: &str) -> Vec<String> {
         let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
@@ -448,11 +456,8 @@ mod tests {
 
     #[test]
     fn hung_lookup_times_out_by_the_deadline_and_leaves_nothing_running() {
-        use std::hash::BuildHasher;
-        // GNU sleep adds its arguments: the fraction is a token to find the
-        // process by, in the child's background job, which killpg must reach.
-        let random = std::collections::hash_map::RandomState::new().hash_one("hung") % 1_000_000_000;
-        let token = format!("0.000{random:09}");
+        // The token marks the child's background job, which killpg must reach.
+        let token = sleep_token("hung");
         let resolver = sh_resolver(&format!("sleep 30 {token} & wait"), Duration::from_millis(500));
         let start = Instant::now();
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
@@ -460,13 +465,7 @@ mod tests {
         assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
         assert_eq!(map_error(err).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
-        let gone = (0..40).any(|_| {
-            let left = live_with(&token).is_empty();
-            if !left {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            left
-        });
+        let gone = wait_until(40, || live_with(&token).is_empty());
         assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
     }
 
@@ -496,9 +495,7 @@ mod tests {
 
     #[test]
     fn lookup_child_dies_with_its_parent() {
-        use std::hash::BuildHasher;
-        let random = std::collections::hash_map::RandomState::new().hash_one("pdeath") % 1_000_000_000;
-        let token = format!("0.000{random:09}");
+        let token = sleep_token("pdeath");
         let mut helper = {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
             Command::new(std::env::current_exe().unwrap())
@@ -510,22 +507,13 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        let wait_for = |cond: &dyn Fn() -> bool| {
-            (0..100).any(|_| {
-                let met = cond();
-                if !met {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                met
-            })
-        };
-        let started = wait_for(&|| !live_with(&token).is_empty());
+        let started = wait_until(100, || !live_with(&token).is_empty());
         // SIGKILL: the parent gets no chance to clean up, as when the TUI dies.
         let _ = helper.kill();
         let _ = helper.wait();
         assert!(started, "the helper's lookup child never started");
         assert!(
-            wait_for(&|| live_with(&token).is_empty()),
+            wait_until(100, || live_with(&token).is_empty()),
             "lookup child outlived its parent: {:?}",
             live_with(&token)
         );

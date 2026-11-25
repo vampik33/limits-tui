@@ -117,6 +117,19 @@ fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {
     Duration::from_secs_f64(secs.clamp(0.001, MAX_TIMEOUT_SECS))
 }
 
+/// Whether `cond` holds within `tries` checks 50 ms apart. Shared by every
+/// probe's tests.
+#[cfg(test)]
+fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
+    (0..tries).any(|_| {
+        let met = cond();
+        if !met {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        met
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
