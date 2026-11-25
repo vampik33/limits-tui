@@ -25,6 +25,12 @@ const LOGIN_MARKER: &str = "@@limits-tui@@";
 /// PIPE_READ_BURST past this before the check), so output that never ends a
 /// line can't take memory without bound until the deadline.
 const RPC_LINE_CAP: usize = 4 * 1024 * 1024;
+/// How long the app server's stdout is still read once the server has exited
+/// but a process it left behind holds stdout open. Everything the server wrote
+/// is in the pipe by then (a write it was blocked in would have kept it from
+/// exiting), so this only lets the reads catch up; run_bounded allows the same
+/// after its child exits.
+const RPC_EXIT_GRACE: Duration = Duration::from_millis(100);
 /// The codex binary to run and, if it needs one, the PATH to run it with.
 struct CodexBin {
     path: std::path::PathBuf,
@@ -286,7 +292,16 @@ impl Rpc {
     }
 
     /// The response with this id; notifications and other lines are skipped.
-    fn wait_for(&mut self, request_id: i64) -> Result<serde_json::Value, ProbeError> {
+    /// Waits on `child`, the app server, by its exit, not by stdout closing:
+    /// once it has exited, what it left in the pipe is read for up to
+    /// RPC_EXIT_GRACE and once more when that ends (a process it started may
+    /// hold stdout open for longer), and with no response by then this fails.
+    /// `child` is never reaped here, so kill_tree can still signal its group.
+    fn wait_for(&mut self, child: &Child, request_id: i64) -> Result<serde_json::Value, ProbeError> {
+        // When reading stops once the server has exited; None while it runs.
+        let mut exit_grace_end = None;
+        // Whether the grace has ended: what the server left has been read.
+        let mut ended = false;
         loop {
             // Complete lines, consumed in one drain after the scan.
             let mut start = 0;
@@ -306,18 +321,31 @@ impl Rpc {
             if self.pending.len() > RPC_LINE_CAP {
                 return Err(ProbeError::new(ErrorCode::Failed, "codex app-server sent an over-long line"));
             }
-            if self.stdout.closed {
+            if self.stdout.closed || ended {
                 if self.pending.is_empty() {
                     return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited"));
                 }
-                // EOF ends the last line too.
+                // EOF, or the server's exit, ends the last line too.
                 self.pending.push(b'\n');
                 continue;
             }
+            // Failing to check on the server counts as not exited: the
+            // deadline still bounds the wait.
+            if exit_grace_end.is_none() && has_exited(child).unwrap_or(false) {
+                exit_grace_end = Some((Instant::now() + RPC_EXIT_GRACE).min(self.deadline));
+            }
             let pending = &mut self.pending;
-            if !self.stdout.step(self.deadline, |chunk| pending.extend_from_slice(chunk)) {
+            if self.stdout.step(exit_grace_end.unwrap_or(self.deadline), |chunk| pending.extend_from_slice(chunk)) {
+                continue;
+            }
+            if exit_grace_end.is_none() {
                 return Err(ProbeError::new(ErrorCode::Timeout, "codex app-server did not answer in time"));
             }
+            // The grace is over. A thread stalled past it has not read what
+            // the server left: read the pipe once more, then end as at EOF.
+            let pending = &mut self.pending;
+            self.stdout.drain(|chunk| pending.extend_from_slice(chunk));
+            ended = true;
         }
     }
 }
@@ -394,10 +422,10 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
             "id": 0,
             "params": {"clientInfo": {"name": "limits-tui", "title": "Limits TUI", "version": "0.1.0"}},
         }))?;
-        rpc.wait_for(0)?;
+        rpc.wait_for(&child, 0)?;
         rpc.send(&serde_json::json!({"method": "initialized", "params": {}}))?;
         rpc.send(&serde_json::json!({"method": "account/rateLimits/read", "id": 1}))?;
-        normalize(&rpc.wait_for(1)?)
+        normalize(&rpc.wait_for(&child, 1)?)
     })();
 
     kill_tree(&mut child);
@@ -1061,6 +1089,120 @@ mod tests {
         let (result, elapsed) = rate_limits_from(&scratch, "read line\nexit 0", Duration::from_secs(10));
         let err = expect_err(result);
         assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    /// `read_rate_limits` against a server that starts `sleep 30` in the
+    /// background, holding its stdout, then runs `body`; checks that it took
+    /// under 3 s and that the holder is gone afterwards. The budget is far past
+    /// that bound: waiting for stdout to close would take all of it.
+    fn rate_limits_with_holder(test: &str, body: &str) -> ProbeResult {
+        let scratch = Scratch::new(test);
+        let pidfile = scratch.path("pid");
+        let (result, elapsed) = rate_limits_from(
+            &scratch,
+            &format!("sleep 30 &\necho $! > {}\n{body}", pidfile.display()),
+            Duration::from_secs(20),
+        );
+        let holder = read_pid(&pidfile);
+        let gone = is_gone(holder);
+        if !gone {
+            // SAFETY: plain signal to the test's own background sleep.
+            unsafe {
+                libc::kill(holder, libc::SIGKILL);
+            }
+        }
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+        assert!(gone, "the background holder outlived the probe");
+        result
+    }
+
+    #[test]
+    fn app_server_that_exits_before_initialize_reply_fails_despite_a_stdout_holder() {
+        let result = rate_limits_with_holder("rpcexitinit", "read line\nexit 0");
+        let err = expect_err(result);
+        assert_eq!((err.code, err.detail.as_str()), (ErrorCode::Failed, "codex app-server exited"), "{err:?}");
+    }
+
+    #[test]
+    fn app_server_that_exits_before_rate_limits_reply_fails_despite_a_stdout_holder() {
+        let result =
+            rate_limits_with_holder("rpcexitlimits", "read line\necho \"$INIT\"\nread line\nread line\nexit 0");
+        let err = expect_err(result);
+        assert_eq!((err.code, err.detail.as_str()), (ErrorCode::Failed, "codex app-server exited"), "{err:?}");
+    }
+
+    #[test]
+    fn reply_written_just_before_exit_is_used_despite_a_stdout_holder() {
+        let result = rate_limits_with_holder(
+            "rpcexitreply",
+            "read line\necho \"$INIT\"\nread line\nread line\necho \"$LIMITS\"\nexit 0",
+        );
+        expect_ok(result);
+    }
+
+    #[test]
+    fn reply_without_newline_before_exit_is_used_despite_a_stdout_holder() {
+        // Only the server's exit ends this line: stdout stays open.
+        let result = rate_limits_with_holder(
+            "rpcexitnonl",
+            "read line\necho \"$INIT\"\nread line\nread line\nprintf '%s' \"$LIMITS\"\nexit 0",
+        );
+        expect_ok(result);
+    }
+
+    #[test]
+    fn partial_line_before_exit_fails_despite_a_stdout_holder() {
+        let result = rate_limits_with_holder("rpcexitpartial", "read line\nprintf '%s' '{\"id\":0,'\nexit 0");
+        let err = expect_err(result);
+        assert_eq!((err.code, err.detail.as_str()), (ErrorCode::Failed, "codex app-server exited"), "{err:?}");
+    }
+
+    /// What `wait_for(0)` gives once the `/bin/sh` app server `body` has
+    /// answered the initialize request and exited, with `pending` read
+    /// before and the exit grace already passed at the first step, as after
+    /// a stall of the probing thread.
+    fn reply_after_the_exit_grace(test: &str, body: &str, pending: &[u8]) -> Result<serde_json::Value, ProbeError> {
+        let scratch = Scratch::new(test);
+        let codex = scratch.script("codex", &format!("#!/bin/sh\n{body}\n"));
+        let mut child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            app_server_command(&CodexBin { path: codex, child_path: None }, std::env::var_os("PATH").as_deref())
+                .spawn()
+                .unwrap()
+        };
+        let mut rpc = Rpc::spawn(&mut child, Instant::now() + Duration::from_secs(5)).unwrap();
+        rpc.send(&serde_json::json!({"method": "initialize", "id": 0})).unwrap();
+        let exited = wait_until(40, || has_exited(&child).unwrap_or(false));
+        rpc.pending = pending.to_vec();
+        rpc.deadline = Instant::now();
+        let result = if exited { Some(rpc.wait_for(&child, 0)) } else { None };
+        drop(rpc);
+        kill_tree(&mut child);
+        result.expect("the fake app server did not exit")
+    }
+
+    #[test]
+    fn reply_in_the_pipe_is_read_when_the_exit_grace_has_passed() {
+        let result = reply_after_the_exit_grace("rpclapse", &format!("read line\necho '{INIT_REPLY}'\nexit 0"), b"");
+        assert_eq!(result.unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn partial_line_read_before_the_exit_grace_passed_is_completed() {
+        let result =
+            reply_after_the_exit_grace("rpclapsepartial", "read line\necho '\"result\":{}}'\nexit 0", br#"{"id":0,"#);
+        assert_eq!(result.unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn live_app_server_with_a_stdout_holder_still_times_out() {
+        let scratch = Scratch::new("rpcsilentholder");
+        // The server stays up after reading the request: no exit, no grace.
+        let (result, elapsed) =
+            rate_limits_from(&scratch, "sleep 30 &\nread line\nsleep 30", Duration::from_millis(1500));
+        assert_eq!(expect_err(result).code, ErrorCode::Timeout);
+        assert!(elapsed >= Duration::from_millis(1500), "gave up early, after {elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 

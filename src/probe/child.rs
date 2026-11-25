@@ -67,7 +67,7 @@ impl Pipe {
     }
 
     /// Read what the pipe has for now, up to PIPE_READ_BURST bytes.
-    fn drain(&mut self, mut sink: impl FnMut(&[u8])) {
+    pub(super) fn drain(&mut self, mut sink: impl FnMut(&[u8])) {
         let mut chunk = [0u8; 4096];
         let mut read = 0;
         loop {
