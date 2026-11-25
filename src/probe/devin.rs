@@ -64,6 +64,7 @@ impl Resolver for ChildResolver {
         let millis = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args).args([RESOLVE_ARG, &host_port, &millis.to_string()]);
+        die_with_parent(&mut cmd);
         let output = run_bounded(&mut cmd, end).unwrap_or_default();
         let found: Vec<SocketAddr> =
             String::from_utf8_lossy(&output).lines().filter_map(|l| l.trim().parse().ok()).collect();
@@ -222,6 +223,35 @@ fn resolve_with(
         return 1;
     }
     0
+}
+
+/// Makes the child of `cmd` get SIGKILL when the thread that spawns it exits
+/// (Linux: PR_SET_PDEATHSIG). That thread waits in run_bounded until the child
+/// is reaped, so the signal only fires when the whole process goes, the TUI
+/// quitting mid-lookup; without it the child would run on to its own timeout.
+fn die_with_parent(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: the closure runs in the forked child before exec. It calls
+        // only prctl and getppid, which are async-signal-safe, and builds its
+        // errors from errno without allocating.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent died before prctl, so the signal will never come.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
 }
 
 /// This binary, to run as the lookup child. `/proc/self/exe` still runs it
@@ -436,6 +466,57 @@ mod tests {
             left
         });
         assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
+    }
+
+    /// Set only for the helper run by `lookup_child_dies_with_its_parent`: the
+    /// token its lookup child carries.
+    const PARENT_HELPER_ENV: &str = "LIMITS_TUI_TEST_PDEATH_TOKEN";
+
+    /// Not a test of its own: the parent process for
+    /// `lookup_child_dies_with_its_parent`, which runs this test binary with
+    /// PARENT_HELPER_ENV set and kills it mid-lookup. A plain run returns at once.
+    #[test]
+    fn lookup_child_parent_helper() {
+        let Ok(token) = std::env::var(PARENT_HELPER_ENV) else { return };
+        let resolver = sh_resolver(&format!("exec sleep 30 {token}"), Duration::from_secs(30));
+        let _ = resolve_uri(&resolver, "https://example.com/", &Config::default());
+    }
+
+    #[test]
+    fn lookup_child_dies_with_its_parent() {
+        use std::hash::BuildHasher;
+        let random = std::collections::hash_map::RandomState::new().hash_one("pdeath") % 1_000_000_000;
+        let token = format!("0.000{random:09}");
+        let mut helper = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "probe::devin::tests::lookup_child_parent_helper", "--test-threads=1"])
+                .env(PARENT_HELPER_ENV, &token)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let wait_for = |cond: &dyn Fn() -> bool| {
+            (0..100).any(|_| {
+                let met = cond();
+                if !met {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                met
+            })
+        };
+        let started = wait_for(&|| !live_with(&token).is_empty());
+        // SIGKILL: the parent gets no chance to clean up, as when the TUI dies.
+        let _ = helper.kill();
+        let _ = helper.wait();
+        assert!(started, "the helper's lookup child never started");
+        assert!(
+            wait_for(&|| live_with(&token).is_empty()),
+            "lookup child outlived its parent: {:?}",
+            live_with(&token)
+        );
     }
 
     #[test]
