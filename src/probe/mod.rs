@@ -1,3 +1,4 @@
+mod child;
 pub mod claude;
 pub mod codex;
 pub mod devin;
@@ -8,6 +9,13 @@ use std::time::Duration;
 /// built from them in range: `Instant + Duration` panics on overflow, here and
 /// inside ureq.
 const MAX_TIMEOUT_SECS: f64 = 24.0 * 3600.0;
+
+/// A child forked by one test thread inherits another thread's script while it
+/// is still open for writing, and exec'ing that script then fails with
+/// ETXTBSY. Script writes hold this exclusively, forks hold it shared, so no
+/// fork overlaps an open script. Shared by every probe's tests.
+#[cfg(test)]
+static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// One quota/rate-limit window as the UI needs it, normalized across sources.
 pub struct UsageWindow {
@@ -116,6 +124,19 @@ pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
 fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {
     let secs = raw.and_then(|s| s.parse::<f64>().ok()).filter(|t| !t.is_nan()).unwrap_or(default_secs);
     Duration::from_secs_f64(secs.clamp(0.001, MAX_TIMEOUT_SECS))
+}
+
+/// Whether `cond` holds within `tries` checks 50 ms apart. Shared by every
+/// probe's tests.
+#[cfg(test)]
+fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
+    (0..tries).any(|_| {
+        let met = cond();
+        if !met {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        met
+    })
 }
 
 #[cfg(test)]

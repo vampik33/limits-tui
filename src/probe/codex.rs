@@ -5,139 +5,23 @@
 //!
 //! Port of herdr-codex-limits' codex_limits.py.
 
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use super::child::{Pipe, has_exited, run_bounded};
 use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, timeout_from_env, unix_now};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
-/// Most bytes of login-shell output kept: the last ones, where the lookup
-/// result follows the login config's own output.
-const SHELL_OUTPUT_CAP: usize = 64 * 1024;
-/// How long the login shell's stdout may stay open after the shell exits
-/// before the background jobs it left holding it are killed.
-const SHELL_EXIT_GRACE: Duration = Duration::from_millis(100);
 /// Printed by the login-shell lookup before its answer, so the login config's
 /// own output (printed earlier) can't be mistaken for it.
 const LOGIN_MARKER: &str = "@@limits-tui@@";
 
-/// Most bytes one `Pipe::step` reads, so a writer that never pauses can't keep
-/// a step going past its deadline.
-const PIPE_READ_BURST: usize = 64 * 1024;
 /// Longest unfinished line kept from the app server (it may grow by one
 /// PIPE_READ_BURST past this before the check), so output that never ends a
 /// line can't take memory without bound until the deadline.
 const RPC_LINE_CAP: usize = 4 * 1024 * 1024;
-
-/// A child's stdout, read without blocking on the caller's thread, so no read
-/// outlasts a deadline and no reader thread is left for a holder of the write
-/// end (a descendant outside the child's process group) to pin. Dropping it
-/// closes the read end; such a holder's later writes get EPIPE.
-struct Pipe {
-    stdout: ChildStdout,
-    /// EOF or a read error; a closed pipe is no longer polled.
-    closed: bool,
-}
-
-impl Pipe {
-    fn new(stdout: ChildStdout) -> Self {
-        let fd = stdout.as_raw_fd();
-        // SAFETY: `fd` is the open read end owned by `stdout`; F_GETFL/F_SETFL
-        // only change its file status flags.
-        let nonblocking = unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
-        };
-        // A blocking read could outlast the deadline, so without O_NONBLOCK
-        // the pipe is not read at all.
-        Self { stdout, closed: !nonblocking }
-    }
-
-    /// Wait up to 25 ms, never past `deadline`, for output and pass what was
-    /// read to `sink`, chunk by chunk. Returns false once `deadline` has
-    /// passed.
-    fn step(&mut self, deadline: Instant, sink: impl FnMut(&[u8])) -> bool {
-        let step = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25));
-        if step.is_zero() {
-            return false;
-        }
-        if self.closed {
-            std::thread::sleep(step);
-            return true;
-        }
-        let mut fds = libc::pollfd { fd: self.stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: `fds` is one valid pollfd for the duration of the call and
-        // its fd is owned by `self.stdout`, which outlives it. The result is
-        // not needed: POLLIN, POLLHUP, POLLERR, a timeout and EINTR are all
-        // handled by draining.
-        unsafe {
-            libc::poll(&mut fds, 1, step.as_millis() as libc::c_int);
-        }
-        self.drain(sink);
-        true
-    }
-
-    /// Read what the pipe has for now, up to PIPE_READ_BURST bytes.
-    fn drain(&mut self, mut sink: impl FnMut(&[u8])) {
-        let mut chunk = [0u8; 4096];
-        let mut read = 0;
-        loop {
-            if read >= PIPE_READ_BURST {
-                return;
-            }
-            match self.stdout.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    sink(&chunk[..n]);
-                    read += n;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(_) => break,
-            }
-        }
-        self.closed = true;
-    }
-}
-
-/// The login shell's stdout and the last SHELL_OUTPUT_CAP bytes it printed.
-struct ShellOutput {
-    pipe: Pipe,
-    tail: Vec<u8>,
-}
-
-impl ShellOutput {
-    fn new(stdout: ChildStdout) -> Self {
-        Self { pipe: Pipe::new(stdout), tail: Vec::new() }
-    }
-
-    /// `Pipe::step`, keeping the output's tail.
-    fn step(&mut self, deadline: Instant) -> bool {
-        let tail = &mut self.tail;
-        self.pipe.step(deadline, |chunk| {
-            tail.extend_from_slice(chunk);
-            let excess = tail.len().saturating_sub(SHELL_OUTPUT_CAP);
-            tail.drain(..excess);
-        })
-    }
-
-    /// Read until stdout closes or SHELL_EXIT_GRACE passes, never past
-    /// `deadline`.
-    fn settle(&mut self, deadline: Instant) {
-        let end = (Instant::now() + SHELL_EXIT_GRACE).min(deadline);
-        while !self.pipe.closed && self.step(end) {}
-    }
-
-    /// The output kept so far. Consuming `self` closes the read end, so a
-    /// holder outside the shell's group keeps nothing of this call alive.
-    fn into_tail(self) -> Vec<u8> {
-        self.tail
-    }
-}
-
 /// The codex binary to run and, if it needs one, the PATH to run it with.
 struct CodexBin {
     path: std::path::PathBuf,
@@ -153,74 +37,16 @@ fn is_exe(p: &std::path::Path) -> bool {
     p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
-/// Whether `child` has exited, without reaping it: its pid stays reserved, so
-/// it is still safe to signal as a process group id.
-fn has_exited(child: &Child) -> std::io::Result<bool> {
-    // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves the child
-    // to be reaped by `Child::wait`.
-    let rc = unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: waitid succeeded; with WNOHANG, si_pid stays 0 until the child
-    // has exited.
-    Ok(unsafe { info.si_pid() } != 0)
-}
-
-/// The last SHELL_OUTPUT_CAP bytes of stdout of `shell -lc`, printing
-/// LOGIN_MARKER, the exported PATH (an empty line if unset) and `command -v
-/// codex`, or None if the shell could not be started. Returns by
-/// `shell_deadline`, apart from reaping a killed shell. Background jobs of the
-/// login config that still hold stdout once the shell has exited (or the shell
-/// itself, at the deadline) are killed with the shell's process group. Holders
-/// outside that group (setsid) can't be reached, but the read end is closed on
-/// return, so nothing outlives the call: their later writes get EPIPE. Runs in
-/// `/` for the reason given at app_server_command.
+/// The last OUTPUT_CAP bytes of stdout of `shell -lc`, printing LOGIN_MARKER,
+/// the exported PATH (an empty line if unset) and `command -v codex`, or None
+/// if the shell could not be started. Bounded by `shell_deadline` as
+/// `run_bounded` describes; that includes background jobs of the login config
+/// that still hold stdout once the shell has exited.
 fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
     let lookup = format!("printf '%s\\n' '{LOGIN_MARKER}'; printenv PATH || echo; command -v codex");
-    let mut child = Command::new(shell)
-        .args(["-lc", &lookup])
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0) // a non-interactive shell keeps its background jobs in this group
-        .spawn()
-        .ok()?;
-    let mut output = ShellOutput::new(child.stdout.take().expect("stdout is piped"));
-
-    // (A) Wait for the shell itself, not for stdout to close; failing to
-    // check on it counts as not exited.
-    let exited = loop {
-        match has_exited(&child) {
-            Ok(true) => break true,
-            Ok(false) if output.step(shell_deadline) => {}
-            _ => break false,
-        }
-    };
-    // (B) Let stdout drain and close.
-    if exited {
-        output.settle(shell_deadline);
-    }
-    // (C) Kill the shell, or what still holds its stdout.
-    if !(exited && output.pipe.closed) {
-        // SAFETY: killpg only sends a signal. The group id is the pid of our
-        // child, which leads the group created by process_group(0); the child
-        // is not reaped yet (has_exited uses WNOWAIT), so the id cannot have
-        // been reused.
-        unsafe {
-            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-        }
-        // Killed holders release stdout at once.
-        output.settle(shell_deadline);
-    }
-    let tail = output.into_tail();
-    let _ = child.wait();
-    Some(tail)
+    run_bounded(Command::new(shell).args(["-lc", &lookup]), shell_deadline)
 }
 
 /// `dir` followed by `current` (a PATH value), skipping an empty `current`:
@@ -570,11 +396,7 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
 mod tests {
     use super::*;
 
-    /// A child forked by one test thread inherits another thread's script
-    /// while it is still open for writing, and exec'ing that script then fails
-    /// with ETXTBSY. Script writes hold this exclusively, lookups (which fork)
-    /// hold it shared, so no fork overlaps an open script.
-    static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    use crate::probe::{SCRIPTS, wait_until};
 
     /// Per-test temp dir, removed on drop.
     struct Scratch(std::path::PathBuf);
@@ -634,17 +456,6 @@ mod tests {
         let pid = std::fs::read_to_string(path).unwrap().trim().parse().unwrap();
         assert!(pid > 0, "bad pid {pid} in {}", path.display());
         pid
-    }
-
-    /// Whether `cond` holds within `tries` checks 50 ms apart.
-    fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
-        (0..tries).any(|_| {
-            let met = cond();
-            if !met {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            met
-        })
     }
 
     /// Whether `pid` is gone (or a zombie awaiting init) within about 2s.
@@ -713,7 +524,7 @@ mod tests {
         let (out, elapsed) = lookup(&shell, Duration::from_secs(5));
         let out = out.unwrap();
         assert!(!out.is_empty());
-        assert!(out.len() <= SHELL_OUTPUT_CAP, "read {} bytes", out.len());
+        assert!(out.len() <= super::super::child::OUTPUT_CAP, "read {} bytes", out.len());
         // The path printed after the startup noise survives the cap.
         assert!(
             out.ends_with(b"\n/bin/sh\n"),

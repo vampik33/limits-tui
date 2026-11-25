@@ -217,6 +217,11 @@ fn printable(text: &str) -> String {
 }
 
 fn main() -> std::io::Result<()> {
+    // First, so no argument of the Devin probe's lookup child can read as a flag.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == probe::devin::RESOLVE_ARG) {
+        std::process::exit(probe::devin::resolve_main(&args[2..]));
+    }
     if std::env::args().any(|a| a == "--once" || a == "-1") {
         run_once();
         return Ok(());
