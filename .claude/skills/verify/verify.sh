@@ -128,8 +128,8 @@ once() {
 tui() {
   local log="$out/tui.log" t0=$SECONDS i status q
   : >"$log"
-  sockdir=$(mktemp -d "${TMPDIR:-/tmp}/limits-tui-verify.XXXXXXXX" 2>>"$log") || fail tui "$log" "mktemp -d failed"
-  sock="$sockdir/tmux.sock"
+  sockdir=$(mktemp -d "${TMPDIR:-/tmp}/limits-tui.XXXXXXXX" 2>>"$log") || fail tui "$log" "mktemp -d failed"
+  sock="$sockdir/sock"
   # Placeholder first, so remain-on-exit is set before the app starts: a crash at startup
   # then leaves its exit status and panic message in the pane.
   tmux -S "$sock" -f /dev/null new-session -d -x 120 -y 40 -s v "sleep 600" >>"$log" 2>&1 ||
