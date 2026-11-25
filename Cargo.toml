@@ -11,8 +11,7 @@ libc = "0.2.191"
 ratatui = "0.30.2"
 serde_json = "1.0.154"
 toml = "1.2.1"
-# ~: devin.rs uses ureq::unversioned, which ureq may break in a minor release.
-ureq = "~3.5.2"
+ureq = "3.5.2"
 
 [profile.release]
 lto = true
