@@ -303,22 +303,20 @@ mod tests {
 
     #[test]
     fn unreadable_remaining_percent_is_an_error() {
-        for (field, reset_field, remaining) in [
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("NaN")),
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("inf")),
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("-inf")),
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!("abc")),
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!(true)),
-            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", serde_json::json!({})),
-            ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", serde_json::json!("NaN")),
-            ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", serde_json::json!("abc")),
+        let bad =
+            [serde_json::json!("NaN"), "inf".into(), "-inf".into(), "abc".into(), true.into(), serde_json::json!({})];
+        for (field, reset_field) in [
+            ("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix"),
+            ("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix"),
         ] {
-            let mut p = payload(None);
-            p["userStatus"]["planStatus"][reset_field] = "1800000000".into();
-            p["userStatus"]["planStatus"][field] = remaining.clone();
-            let err = normalize(&p, "key").err().expect("should fail");
-            assert_eq!(err.code, ErrorCode::Failed, "{field}: {remaining}");
-            assert!(err.detail.contains("quota percentage"), "{field}: {remaining}: {}", err.detail);
+            for remaining in &bad {
+                let mut p = payload(None);
+                p["userStatus"]["planStatus"][reset_field] = "1800000000".into();
+                p["userStatus"]["planStatus"][field] = remaining.clone();
+                let err = normalize(&p, "key").err().expect("should fail");
+                assert_eq!(err.code, ErrorCode::Failed, "{field}: {remaining}");
+                assert!(err.detail.contains("quota percentage"), "{field}: {remaining}: {}", err.detail);
+            }
         }
     }
 

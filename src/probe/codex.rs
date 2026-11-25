@@ -509,9 +509,9 @@ fn normalize(result: &serde_json::Value) -> Result<FetchOk, ProbeError> {
                 continue;
             }
         };
-        let used = json_f64(&w["usedPercent"]);
-        let Some(window) =
-            used.zip(json_int(&w["resetsAt"])).and_then(|(used, resets)| UsageWindow::new(label, used, resets))
+        let Some(window) = json_f64(&w["usedPercent"])
+            .zip(json_int(&w["resetsAt"]))
+            .and_then(|(used, resets)| UsageWindow::new(label, used, resets))
         else {
             unrecognized = true;
             continue;
