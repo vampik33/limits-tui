@@ -108,7 +108,8 @@ launches from a desktop that lacks it).
 
 Sign in to the Devin CLI. limits-tui reads the API key from `~/.local/share/devin/credentials.toml` and asks the
 API server configured there (by default `https://server.codeium.com`) for your quota. The key is only ever sent
-over https.
+over https. The server's address is looked up in a short-lived copy of limits-tui, so a DNS lookup that hangs is
+stopped at `DEVIN_LIMITS_TIMEOUT` instead of running on in the background.
 
 ## Configuration
 

@@ -10,6 +10,13 @@ use std::time::Duration;
 /// inside ureq.
 const MAX_TIMEOUT_SECS: f64 = 24.0 * 3600.0;
 
+/// A child forked by one test thread inherits another thread's script while it
+/// is still open for writing, and exec'ing that script then fails with
+/// ETXTBSY. Script writes hold this exclusively, forks hold it shared, so no
+/// fork overlaps an open script. Shared by every probe's tests.
+#[cfg(test)]
+static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// One quota/rate-limit window as the UI needs it, normalized across sources.
 pub struct UsageWindow {
     /// Short label for the window: "5h", "day", "wk".

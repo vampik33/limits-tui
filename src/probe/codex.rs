@@ -393,11 +393,7 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
 mod tests {
     use super::*;
 
-    /// A child forked by one test thread inherits another thread's script
-    /// while it is still open for writing, and exec'ing that script then fails
-    /// with ETXTBSY. Script writes hold this exclusively, lookups (which fork)
-    /// hold it shared, so no fork overlaps an open script.
-    static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    use crate::probe::SCRIPTS;
 
     /// Per-test temp dir, removed on drop.
     struct Scratch(std::path::PathBuf);

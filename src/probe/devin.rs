@@ -1,18 +1,80 @@
 //! Devin CLI quota usage: read the credentials TOML and POST GetUserStatus to
 //! the configured API server. Port of herdr-devin-limits' devin_limits.py.
 
-use std::time::Instant;
+use std::ffi::OsString;
+use std::io::Write;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use ureq::config::Config;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+
+use super::child::run_bounded;
 use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, timeout_from_env, unix_now};
+
+/// argv[1] that runs limits-tui as the Devin probe's DNS lookup child:
+/// `limits-tui __resolve <host:port> <timeout_ms>`. Internal, not in `--help`.
+pub const RESOLVE_ARG: &str = "__resolve";
 
 const DEFAULT_API_SERVER_URL: &str = "https://server.codeium.com";
 const STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 const QUOTA_BILLING_STRATEGY: &str = "BILLING_STRATEGY_QUOTA";
+/// Most addresses kept from one lookup, as ureq's own resolver keeps.
+const MAX_ADDRS: usize = 16;
 
 struct Credentials {
     api_key: String,
     api_server_url: String,
+}
+
+/// Looks the API server up in a child process (limits-tui `__resolve`) that is
+/// killed with its process group at the probe's deadline. getaddrinfo can't be
+/// cancelled, so ureq's own resolver, which runs it on a thread and stops
+/// waiting at the deadline, leaves that thread running past the probe.
+#[derive(Debug)]
+struct ChildResolver {
+    program: PathBuf,
+    /// Put before `RESOLVE_ARG`: tests run `/bin/sh -c <script>` as the child.
+    args: Vec<String>,
+    deadline: Instant,
+}
+
+impl Resolver for ChildResolver {
+    fn resolve(&self, uri: &Uri, config: &Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let host_port = uri
+            .scheme()
+            .zip(uri.authority())
+            .and_then(|(scheme, authority)| DefaultResolver::host_and_port(scheme, authority))
+            .ok_or_else(|| ureq::Error::BadUri(uri.to_string()))?;
+        let now = Instant::now();
+        // ureq's "no timeout" is u64::MAX seconds: `now + after` would panic.
+        let end = now.checked_add(*timeout.after).map_or(self.deadline, |t| t.min(self.deadline));
+        let millis = u64::try_from(end.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX);
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args).args([RESOLVE_ARG, &host_port, &millis.to_string()]);
+        let output = run_bounded(&mut cmd, end).unwrap_or_default();
+        let found: Vec<SocketAddr> =
+            String::from_utf8_lossy(&output).lines().filter_map(|l| l.trim().parse().ok()).collect();
+        if found.is_empty() {
+            return Err(if Instant::now() >= end {
+                ureq::Error::Timeout(timeout.reason)
+            } else {
+                // What a failed `to_socket_addrs` gives in ureq's own resolver.
+                ureq::Error::Io(std::io::Error::other(format!("could not resolve {host_port}")))
+            });
+        }
+        let mut addrs = self.empty();
+        for addr in config.ip_family().keep_wanted(found.into_iter()).take(MAX_ADDRS) {
+            addrs.push(addr);
+        }
+        if addrs.is_empty() { Err(ureq::Error::HostNotFound) } else { Ok(addrs) }
+    }
 }
 
 fn load_credentials() -> Result<Credentials, ProbeError> {
@@ -88,13 +150,10 @@ pub fn fetch() -> ProbeResult {
         }
     });
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(deadline - Instant::now()))
-        .http_status_as_error(false) // read the body ourselves, like the Python probe
-        .https_only(true) // also refuse redirects to plain http
-        .build()
-        .into();
-    let mut response = agent
+    let program = self_exe().ok_or_else(|| {
+        ProbeError::new(ErrorCode::Failed, "cannot find limits-tui's own executable for the DNS lookup")
+    })?;
+    let mut response = agent(ChildResolver { program, args: Vec::new(), deadline })
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Connect-Protocol-Version", "1")
@@ -122,6 +181,58 @@ pub fn fetch() -> ProbeResult {
     let payload: serde_json::Value = serde_json::from_str(&text)
         .map_err(|_| ProbeError::new(ErrorCode::Failed, "API response is not valid JSON"))?;
     normalize(&payload, &creds.api_key)
+}
+
+/// The lookup child: `args` are what follows RESOLVE_ARG. Prints up to
+/// MAX_ADDRS addresses of `<host:port>`, one per line, and returns the exit
+/// code: 0 with addresses, 1 without (none, lookup error, `<timeout_ms>`
+/// passed), 2 for bad arguments. The process exits right after, which ends a
+/// lookup still running, so the child can't outlive `<timeout_ms>` even when
+/// the probe that started it is gone (the TUI quit mid-lookup).
+pub fn resolve_main(args: &[OsString]) -> i32 {
+    resolve_with(args, |host_port| host_port.to_socket_addrs().map(Iterator::collect), &mut std::io::stdout())
+}
+
+/// `resolve_main` with the lookup and the output as parameters, for tests.
+fn resolve_with(
+    args: &[OsString],
+    lookup: impl FnOnce(&str) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    out: &mut impl Write,
+) -> i32 {
+    let [host_port, timeout_ms] = args else { return 2 };
+    let (Some(host_port), Some(timeout_ms)) =
+        (host_port.to_str(), timeout_ms.to_str().and_then(|ms| ms.parse::<u64>().ok()))
+    else {
+        return 2;
+    };
+    let host_port = host_port.to_string();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(lookup(&host_port));
+    });
+    let Ok(Ok(addrs)) = rx.recv_timeout(Duration::from_millis(timeout_ms)) else { return 1 };
+    let text: String = addrs.iter().take(MAX_ADDRS).map(|a| format!("{a}\n")).collect();
+    if text.is_empty() || out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_err() {
+        return 1;
+    }
+    0
+}
+
+/// This binary, to run as the lookup child. `/proc/self/exe` still runs it
+/// after `cargo install` replaced the file during a long TUI session.
+fn self_exe() -> Option<PathBuf> {
+    let proc_exe = Path::new("/proc/self/exe");
+    if proc_exe.exists() { Some(proc_exe.into()) } else { std::env::current_exe().ok() }
+}
+
+/// The agent for the GetUserStatus request, bounded by `resolver.deadline`.
+fn agent(resolver: ChildResolver) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(resolver.deadline - Instant::now()))
+        .http_status_as_error(false) // read the body ourselves, like the Python probe
+        .https_only(true) // also refuse redirects to plain http
+        .build();
+    ureq::Agent::with_parts(config, DefaultConnector::default(), resolver)
 }
 
 fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
@@ -189,6 +300,231 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::SCRIPTS;
+    use ureq::config::IpFamily;
+
+    // --- the lookup child and its resolver ---
+
+    /// A resolver that runs `script` with /bin/sh as its child, which gets
+    /// RESOLVE_ARG, host:port and the milliseconds left as $1, $2 and $3.
+    fn sh_resolver(script: &str, budget: Duration) -> ChildResolver {
+        ChildResolver {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into(), "sh".into()],
+            deadline: Instant::now() + budget,
+        }
+    }
+
+    fn resolve_uri(resolver: &ChildResolver, uri: &str, config: &Config) -> Result<Vec<SocketAddr>, ureq::Error> {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let uri: Uri = uri.parse().unwrap();
+        // ureq's "no timeout": the resolver must fall back to its own deadline.
+        let timeout =
+            NextTimeout { after: ureq::unversioned::transport::time::Duration::NotHappening, ..Default::default() };
+        resolver.resolve(&uri, config, timeout).map(|a| a.to_vec())
+    }
+
+    fn resolve(script: &str) -> Result<Vec<SocketAddr>, ureq::Error> {
+        resolve_uri(&sh_resolver(script, Duration::from_secs(5)), "https://example.com/", &Config::default())
+    }
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn child_resolver_returns_the_addresses_in_order() {
+        let got = resolve("printf '%s\\n' 192.0.2.1:443 '[2001:db8::1]:443'").unwrap();
+        assert_eq!(got, addrs(&["192.0.2.1:443", "[2001:db8::1]:443"]));
+    }
+
+    #[test]
+    fn child_resolver_skips_lines_that_are_not_addresses() {
+        let got = resolve("echo junk; echo 192.0.2.1:443; echo 192.0.2.2; echo").unwrap();
+        assert_eq!(got, addrs(&["192.0.2.1:443"]));
+    }
+
+    #[test]
+    fn child_resolver_keeps_at_most_16_addresses() {
+        let got = resolve("i=1; while [ $i -le 20 ]; do echo 192.0.2.$i:443; i=$((i+1)); done").unwrap();
+        assert_eq!(got.len(), MAX_ADDRS);
+        assert_eq!(got[0], "192.0.2.1:443".parse().unwrap());
+    }
+
+    #[test]
+    fn child_resolver_passes_host_port_and_the_time_left() {
+        // An IPv6 literal keeps its brackets, so the child can parse it back.
+        let script = format!("[ \"$1\" = {RESOLVE_ARG} ] && [ \"$3\" -gt 0 ] && [ \"$3\" -le 5000 ] && echo \"$2\"");
+        let resolver = sh_resolver(&script, Duration::from_secs(5));
+        let got = resolve_uri(&resolver, "https://[2001:db8::1]:8443/x", &Config::default()).unwrap();
+        assert_eq!(got, addrs(&["[2001:db8::1]:8443"]));
+        let got = resolve_uri(&resolver, "https://192.0.2.7/x", &Config::default()).unwrap();
+        assert_eq!(got, addrs(&["192.0.2.7:443"]), "the https default port");
+    }
+
+    #[test]
+    fn child_resolver_keeps_the_wanted_ip_family() {
+        let script = "printf '%s\\n' '[2001:db8::1]:443' 192.0.2.1:443";
+        let v4_only = ureq::Agent::config_builder().ip_family(IpFamily::Ipv4Only).build();
+        let resolver = sh_resolver(script, Duration::from_secs(5));
+        assert_eq!(resolve_uri(&resolver, "https://example.com/", &v4_only).unwrap(), addrs(&["192.0.2.1:443"]));
+        let resolver = sh_resolver("echo '[2001:db8::1]:443'", Duration::from_secs(5));
+        let err = resolve_uri(&resolver, "https://example.com/", &v4_only).unwrap_err();
+        assert!(matches!(err, ureq::Error::HostNotFound), "{err}");
+    }
+
+    #[test]
+    fn child_resolver_failing_lookup_could_not_connect() {
+        for script in ["exit 1", "echo nothing-here"] {
+            let err = resolve(script).unwrap_err();
+            assert!(matches!(err, ureq::Error::Io(_)), "{script}: {err}");
+            let err = map_error(err);
+            assert_eq!((err.code, err.detail.as_str()), (ErrorCode::Failed, "could not connect to API server"));
+        }
+    }
+
+    #[test]
+    fn child_resolver_missing_program_could_not_connect() {
+        let resolver = ChildResolver {
+            program: "/nonexistent/limits-tui".into(),
+            args: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
+        assert!(matches!(err, ureq::Error::Io(_)), "{err}");
+    }
+
+    /// Pids of live (not zombie) processes whose command line has `token`.
+    fn live_with(token: &str) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+        dir.filter_map(|e| e.ok())
+            .filter(|e| {
+                let path = e.path();
+                let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
+                let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+                String::from_utf8_lossy(&cmdline).contains(token) && !stat.contains(") Z ")
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn hung_lookup_times_out_by_the_deadline_and_leaves_nothing_running() {
+        use std::hash::BuildHasher;
+        // GNU sleep adds its arguments: the fraction is a token to find the
+        // process by, in the child's background job, which killpg must reach.
+        let random = std::collections::hash_map::RandomState::new().hash_one("hung") % 1_000_000_000;
+        let token = format!("0.000{random:09}");
+        let resolver = sh_resolver(&format!("sleep 30 {token} & wait"), Duration::from_millis(500));
+        let start = Instant::now();
+        let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
+        assert_eq!(map_error(err).code, ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        let gone = (0..40).any(|_| {
+            let left = live_with(&token).is_empty();
+            if !left {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            left
+        });
+        assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
+    }
+
+    #[test]
+    fn deadline_already_passed_times_out_at_once() {
+        let resolver = sh_resolver("sleep 30", Duration::ZERO);
+        let start = Instant::now();
+        let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
+        assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn agent_still_refuses_plain_http() {
+        let resolver = sh_resolver("echo 127.0.0.1:9", Duration::from_secs(5));
+        let err = agent(resolver).post("http://127.0.0.1:9/").send("").unwrap_err();
+        assert!(matches!(err, ureq::Error::RequireHttpsOnly(_)), "{err}");
+    }
+
+    // --- resolve_main / resolve_with ---
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn run_child(
+        args: &[&str],
+        lookup: impl FnOnce(&str) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    ) -> (i32, String) {
+        let mut out = Vec::new();
+        let code = resolve_with(&os_args(args), lookup, &mut out);
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn lookup_child_prints_one_address_per_line() {
+        let (code, out) = run_child(&["example.com:443", "1000"], |host| {
+            assert_eq!(host, "example.com:443");
+            Ok(addrs(&["192.0.2.1:443", "[2001:db8::1]:443"]))
+        });
+        assert_eq!((code, out.as_str()), (0, "192.0.2.1:443\n[2001:db8::1]:443\n"));
+    }
+
+    #[test]
+    fn lookup_child_prints_at_most_16() {
+        let many: Vec<SocketAddr> = (1..=20).map(|i| SocketAddr::from(([192, 0, 2, i], 443))).collect();
+        let (code, out) = run_child(&["h:443", "1000"], move |_| Ok(many));
+        assert_eq!((code, out.lines().count()), (0, MAX_ADDRS));
+    }
+
+    #[test]
+    fn lookup_child_with_bad_arguments_exits_2() {
+        for args in [&[][..], &["h:443"], &["h:443", "1000", "extra"], &["h:443", "soon"], &["h:443", "-1"]] {
+            let (code, out) = run_child(args, |_| panic!("no lookup for bad arguments"));
+            assert_eq!((code, out.as_str()), (2, ""), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn lookup_child_treats_flag_like_text_as_the_host() {
+        let (code, _) = run_child(&["--once", "1000"], |host| {
+            assert_eq!(host, "--once");
+            Err(std::io::Error::other("no such host"))
+        });
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn lookup_child_without_addresses_exits_1() {
+        assert_eq!(run_child(&["h:443", "1000"], |_| Err(std::io::Error::other("nxdomain"))), (1, String::new()));
+        assert_eq!(run_child(&["h:443", "1000"], |_| Ok(Vec::new())), (1, String::new()));
+    }
+
+    #[test]
+    fn lookup_child_stops_waiting_at_its_timeout() {
+        // The lookup blocks until the test lets it go, after the assertions
+        // (or 5 s, so a child that waits it out fails instead of hanging).
+        let (release, blocked) = mpsc::channel::<()>();
+        let start = Instant::now();
+        let (code, out) = run_child(&["h:443", "100"], move |_| {
+            let _ = blocked.recv_timeout(Duration::from_secs(5));
+            Ok(addrs(&["192.0.2.1:443"]))
+        });
+        let elapsed = start.elapsed();
+        drop(release);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn lookup_child_resolves_localhost_for_real() {
+        let (code, out) = run_child(&["localhost:443", "5000"], |h| h.to_socket_addrs().map(Iterator::collect));
+        assert_eq!(code, 0);
+        let first: SocketAddr = out.lines().next().unwrap().parse().unwrap();
+        assert!(first.ip().is_loopback() && first.port() == 443, "{out}");
+    }
 
     #[test]
     fn status_url_accepts_https() {
