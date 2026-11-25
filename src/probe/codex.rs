@@ -294,12 +294,14 @@ impl Rpc {
     /// The response with this id; notifications and other lines are skipped.
     /// Waits on `child`, the app server, by its exit, not by stdout closing:
     /// once it has exited, what it left in the pipe is read for up to
-    /// RPC_EXIT_GRACE (a process it started may hold stdout open for longer),
-    /// and with no response by then this fails. `child` is never reaped here,
-    /// so kill_tree can still signal its group.
+    /// RPC_EXIT_GRACE and once more when that ends (a process it started may
+    /// hold stdout open for longer), and with no response by then this fails.
+    /// `child` is never reaped here, so kill_tree can still signal its group.
     fn wait_for(&mut self, child: &Child, request_id: i64) -> Result<serde_json::Value, ProbeError> {
         // When reading stops once the server has exited; None while it runs.
         let mut exit_grace_end = None;
+        // Whether the pipe was read once more after the grace ended.
+        let mut read_after_grace = false;
         loop {
             // Complete lines, consumed in one drain after the scan.
             let mut start = 0;
@@ -338,6 +340,14 @@ impl Rpc {
             }
             if exit_grace_end.is_none() {
                 return Err(ProbeError::new(ErrorCode::Timeout, "codex app-server did not answer in time"));
+            }
+            // A thread stalled past the grace has not read what the server
+            // left: read the pipe once more, then rescan.
+            if !read_after_grace {
+                read_after_grace = true;
+                let pending = &mut self.pending;
+                self.stdout.drain(|chunk| pending.extend_from_slice(chunk));
+                continue;
             }
             if self.pending.is_empty() {
                 return Err(ProbeError::new(ErrorCode::Failed, "codex app-server exited"));
@@ -1164,6 +1174,43 @@ mod tests {
         assert_eq!((err.code, err.detail.as_str()), (ErrorCode::Failed, "codex app-server exited"), "{err:?}");
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
         assert!(gone, "the background holder outlived the probe");
+    }
+
+    /// What `wait_for(0)` gives once the `/bin/sh` app server `body` has
+    /// answered the initialize request and exited, with `pending` read
+    /// before and the exit grace already passed at the first step, as after
+    /// a stall of the probing thread.
+    fn reply_after_the_exit_grace(test: &str, body: &str, pending: &[u8]) -> Result<serde_json::Value, ProbeError> {
+        let scratch = Scratch::new(test);
+        let codex = scratch.script("codex", &format!("#!/bin/sh\n{body}\n"));
+        let mut child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            app_server_command(&CodexBin { path: codex, child_path: None }, std::env::var_os("PATH").as_deref())
+                .spawn()
+                .unwrap()
+        };
+        let mut rpc = Rpc::spawn(&mut child, Instant::now() + Duration::from_secs(5)).unwrap();
+        rpc.send(&serde_json::json!({"method": "initialize", "id": 0})).unwrap();
+        let exited = wait_until(40, || has_exited(&child).unwrap_or(false));
+        rpc.pending = pending.to_vec();
+        rpc.deadline = Instant::now();
+        let result = if exited { Some(rpc.wait_for(&child, 0)) } else { None };
+        drop(rpc);
+        kill_tree(&mut child);
+        result.expect("the fake app server did not exit")
+    }
+
+    #[test]
+    fn reply_in_the_pipe_is_read_when_the_exit_grace_has_passed() {
+        let result = reply_after_the_exit_grace("rpclapse", &format!("read line\necho '{INIT_REPLY}'\nexit 0"), b"");
+        assert_eq!(result.unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn partial_line_read_before_the_exit_grace_passed_is_completed() {
+        let result =
+            reply_after_the_exit_grace("rpclapsepartial", "read line\necho '\"result\":{}}'\nexit 0", br#"{"id":0,"#);
+        assert_eq!(result.unwrap(), serde_json::json!({}));
     }
 
     #[test]
