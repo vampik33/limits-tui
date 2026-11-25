@@ -6,6 +6,8 @@
 #   quick  cargo fmt --check, clippy (-D warnings), cargo test
 #   run    build, then run the real binary: --once must print the three source lines, and the
 #          TUI in a private tmux server must draw its frame, survive "r", and exit 0 on "q".
+#          Then quit-kills: with a fake codex (CODEX_BIN) that never answers, "q" must also kill
+#          the fake and the background job in its process group.
 #          The captured screens are the evidence: target/verify/screen-*.txt
 #
 # One PASS/FAIL line per step; the first FAIL stops the run with the tail of that step's log.
@@ -93,6 +95,16 @@ dead_status() {
   echo unknown
 }
 
+# Waits up to 5 s for the pane's app to exit.
+wait_pane_dead() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    [ "$(pane '#{pane_dead}')" = 1 ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 # Waits until the pane shows every pattern given (fixed strings), up to 20 s.
 wait_for_screen() { # $1 = capture file, rest = patterns
   local file="$1" i p missing
@@ -126,7 +138,7 @@ once() {
 }
 
 tui() {
-  local log="$out/tui.log" t0=$SECONDS i status q
+  local log="$out/tui.log" t0=$SECONDS status q
   : >"$log"
   sockdir=$(mktemp -d "${TMPDIR:-/tmp}/limits-tui.XXXXXXXX" 2>>"$log") || fail tui "$log" "mktemp -d failed"
   sock="$sockdir/sock"
@@ -145,11 +157,7 @@ tui() {
   wait_for_screen "$out/screen-refresh.txt" "limits" "Claude" "Codex" "Devin" "q quit" >>"$log" ||
     fail tui "$log" "frame broken after r"
   tmux -S "$sock" send-keys -t v q
-  for ((i = 0; i < 20; i++)); do
-    [ "$(pane '#{pane_dead}')" = 1 ] && break
-    sleep 0.25
-  done
-  [ "$(pane '#{pane_dead}')" = 1 ] || fail tui "$log" "still running 5 s after q"
+  wait_pane_dead || fail tui "$log" "still running 5 s after q"
   tmux -S "$sock" capture-pane -p -t v >"$out/screen-exit.txt" 2>/dev/null || true
   status=$(dead_status)
   if [ "$status" != 0 ]; then
@@ -158,6 +166,68 @@ tui() {
   fi
   if grep -q "panicked" "$out/screen-exit.txt"; then fail tui "$out/screen-exit.txt" "panic message on screen"; fi
   echo "PASS tui ($((SECONDS - t0))s) screens: $out/screen-{start,refresh,exit}.txt"
+}
+
+# Whether pid $1 is alive in process group $2: its /proc stat shows that group and a state other
+# than Z. A pid gone, reaped, a zombie, or reused outside the group is not.
+alive_in_group() {
+  local stat fields
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  read -r -a fields <<<"${stat##*) }" # "pid (comm) state ppid pgrp ...": comm may hold anything
+  [ "${fields[0]}" != Z ] && [ "${fields[2]}" = "$2" ]
+}
+
+# Whether $1 is a pid that may be signalled: numeric, and neither 0 nor 1.
+valid_pid() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]] && [ "$1" -gt 1 ]; }
+
+# Quitting must kill the children of probes still running: their threads die with the app. A fake
+# codex that never answers starts a background job in its group and records both pids; once q has
+# exited the app, neither may be alive.
+quit_kills() {
+  local log="$out/quit-kills.log" t0=$SECONDS fake="$sockdir/codex" pids="$sockdir/codex.pids"
+  local i q f leader="" job="" status pid left=""
+  : >"$log"
+  # Kills what is left of the fake's group (validated pids only), then fails.
+  qk_fail() {
+    if [ -n "$leader" ]; then kill -KILL -- "-$leader" 2>>"$log" || true; fi
+    fail quit-kills "$log" "$1"
+  }
+  cat >"$fake" <<'EOF' || fail quit-kills "$log" "cannot write the fake codex"
+#!/bin/sh
+sleep 600 &
+echo "$$ $!" >"${0%/*}/codex.pids.new" && mv "${0%/*}/codex.pids.new" "${0%/*}/codex.pids"
+wait
+EOF
+  chmod 700 "$fake" || fail quit-kills "$log" "cannot make the fake codex executable"
+  printf -v q %q "$bin"
+  printf -v f %q "$fake"
+  tmux -S "$sock" respawn-pane -k -t v "exec env CODEX_BIN=$f CODEX_LIMITS_TIMEOUT=600 $q" >>"$log" 2>&1 ||
+    fail quit-kills "$log" "tmux could not start the app"
+  for ((i = 0; i < 80; i++)); do
+    [ -s "$pids" ] && break
+    sleep 0.25
+  done
+  [ -s "$pids" ] || fail quit-kills "$log" "the fake codex never started (no $pids after 20 s)"
+  read -r leader job <"$pids"
+  echo "fake codex: group leader $leader, background job $job" >>"$log"
+  valid_pid "$leader" || fail quit-kills "$log" "bad group leader pid '$leader' in $pids"
+  valid_pid "$job" || qk_fail "bad job pid '$job' in $pids"
+  wait_for_screen "$out/screen-quit-kills.txt" "limits" "Claude" "Codex" "Devin" "q quit" >>"$log" ||
+    qk_fail "first frame incomplete"
+  tmux -S "$sock" send-keys -t v q
+  wait_pane_dead || qk_fail "still running 5 s after q"
+  status=$(dead_status)
+  [ "$status" = 0 ] || qk_fail "exit status $status after q"
+  for ((i = 0; i < 30; i++)); do
+    left=""
+    for pid in "$leader" "$job"; do
+      if alive_in_group "$pid" "$leader"; then left="$left $pid"; fi
+    done
+    [ -z "$left" ] && break
+    sleep 0.1
+  done
+  [ -z "$left" ] || qk_fail "the fake codex's group outlived q (alive 3 s after exit:$left)"
+  echo "PASS quit-kills ($((SECONDS - t0))s)"
 }
 
 # cargo build; bin = the limits-tui executable named in its compiler-artifact message, so a
@@ -179,6 +249,7 @@ run_tier() {
   step build build
   once
   tui
+  quit_kills
 }
 
 case "$tiers" in

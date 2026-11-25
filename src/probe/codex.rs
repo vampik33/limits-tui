@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::child::{Pipe, has_exited, run_bounded};
+use super::child::{CHILDREN, Pipe, has_exited, run_bounded};
 use super::{
     ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, absolute_dirs, inherit_safe_path, json_f64, json_int,
     safe_path, timeout_from_env, unix_now,
@@ -261,7 +261,7 @@ fn kill_tree(child: &mut Child) {
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
-    let _ = child.wait();
+    let _ = CHILDREN.reap(child);
 }
 
 /// Newline-delimited JSON-RPC with the app server over its stdio. Its stdout
@@ -411,8 +411,8 @@ pub fn fetch() -> ProbeResult {
 /// Ask `codex app-server` for the account's rate limits, by `deadline`, then
 /// stop it.
 fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
-    let mut child = app_server_command(codex, std::env::var_os("PATH").as_deref())
-        .spawn()
+    let mut child = CHILDREN
+        .spawn(&mut app_server_command(codex, std::env::var_os("PATH").as_deref()))
         .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
 
     let result = (|| {
@@ -1212,6 +1212,40 @@ mod tests {
         let (result, elapsed) = rate_limits_from(&scratch, "sleep 30", Duration::from_secs(1));
         assert_eq!(expect_err(result).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn running_app_server_is_in_children_for_a_quit_to_kill() {
+        let scratch = Scratch::new("rpcrecord");
+        let pidfile = scratch.path("pid");
+        let codex = scratch.script("codex", &format!("#!/bin/sh\necho $$ > {}\nsleep 30", pidfile.display()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let _ = tx.send(read_rate_limits(&CodexBin { path: codex, child_path: None }, deadline));
+        });
+        assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
+        let pid = read_pid(&pidfile);
+        // Checked before the kill, asserted after: a failed check must not
+        // leave read_rate_limits holding SCRIPTS for its 30 s.
+        let recorded = CHILDREN.contains(pid as u32);
+        assert!(pid > 1, "bad pid {pid}");
+        // End the app server, as a quit would.
+        // SAFETY: killpg only sends a signal. `pid` (the shell, `$$`) leads
+        // the group process_group(0) created, and read_rate_limits reaps it
+        // only once it has exited (this signal; it never answers before its
+        // 30 s deadline), so the id is still its own.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        assert!(recorded, "app server {pid} is not in CHILDREN");
+        let result = rx.recv_timeout(Duration::from_secs(10)).expect("read_rate_limits never returned");
+        // "codex app-server exited", or "closed its input" if it died before
+        // the first request was written.
+        assert_eq!(expect_err(result).code, ErrorCode::Failed);
+        assert!(!CHILDREN.contains(pid as u32), "app server {pid} is still in CHILDREN once reaped");
+        assert!(is_gone(pid), "app server {pid} is still running");
     }
 
     #[test]

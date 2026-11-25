@@ -158,6 +158,14 @@ pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
     parse_timeout(std::env::var(var).ok().as_deref(), default_secs)
 }
 
+/// SIGKILL the process group of every child a probe still runs, and start no
+/// more. For quitting the TUI: its probe threads, which would kill them at
+/// their deadlines, die with the process. Doesn't wait for the probes, only
+/// (half a second at most) for spawns in flight.
+pub fn kill_children() {
+    child::CHILDREN.kill_all();
+}
+
 /// Unparsable values and NaN fall back to `default_secs`; the rest, infinity
 /// included, is clamped to 1 ms ..= MAX_TIMEOUT_SECS, so this never panics.
 fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {
@@ -250,6 +258,28 @@ mod tests {
             let _ = tx.send(f());
         });
         rx.recv_timeout(Duration::from_secs(5)).expect("blocked for more than 5 s")
+    }
+
+    /// A fresh sleep argument to find a test's processes by: GNU sleep adds its
+    /// arguments, so the fraction changes nothing.
+    pub(super) fn sleep_token(test: &str) -> String {
+        use std::hash::BuildHasher;
+        let random = std::collections::hash_map::RandomState::new().hash_one(test) % 1_000_000_000;
+        format!("0.000{random:09}")
+    }
+
+    /// Pids of live (not zombie) processes whose command line has `token`.
+    pub(super) fn live_with(token: &str) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+        dir.filter_map(|e| e.ok())
+            .filter(|e| {
+                let path = e.path();
+                let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
+                let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+                String::from_utf8_lossy(&cmdline).contains(token) && !stat.contains(") Z ")
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
