@@ -294,10 +294,15 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         return Err(ProbeError::new(ErrorCode::Failed, "API response has no plan information"));
     };
 
-    if let Some(strategy) = plan_info.get("billingStrategy")
-        && strategy.as_str() != Some(QUOTA_BILLING_STRATEGY)
-    {
-        return Err(ProbeError::new(ErrorCode::NoQuota, "account does not use quota billing"));
+    match plan_info.get("billingStrategy") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s == QUOTA_BILLING_STRATEGY => {}
+        Some(serde_json::Value::String(_)) => {
+            return Err(ProbeError::new(ErrorCode::NoQuota, "account does not use quota billing"));
+        }
+        _ => {
+            return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid billing strategy"));
+        }
     }
 
     let mut windows = Vec::new();
@@ -306,15 +311,23 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
         ("wk", "weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", "hideWeeklyQuota"),
     ] {
         match plan_info.get(hidden_field) {
-            None | Some(serde_json::Value::Bool(false)) => {}
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
             Some(serde_json::Value::Bool(true)) => continue,
             _ => {
                 return Err(ProbeError::new(ErrorCode::Failed, "API response has an invalid quota visibility flag"));
             }
         }
-        let Some(reset) = json_int(&plan_status[reset_field]).filter(|r| *r > 0) else {
-            continue;
+        // Connect's JSON omits zero-valued fields, and 0 is an unset int64: either
+        // way the window has no reset time and isn't shown.
+        let reset = match plan_status.get(reset_field) {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(v) => json_int(v)
+                .filter(|r| *r >= 0)
+                .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "API response has an invalid quota reset time"))?,
         };
+        if reset == 0 {
+            continue;
+        }
         // Connect's JSON omits zero-valued fields, so a missing percentage is 0% remaining.
         let remaining = match plan_status.get(remaining_field) {
             None | Some(serde_json::Value::Null) => 0,
@@ -832,6 +845,175 @@ mod tests {
             let err = normalize(&payload(Some(bad.clone())), "key").err().expect("should fail");
             assert_eq!(err.code, ErrorCode::Failed, "{bad}");
             assert!(err.detail.contains("overage"), "{bad}: {}", err.detail);
+        }
+    }
+
+    /// `payload(None)` with a valid weekly window as well.
+    fn two_window_payload() -> serde_json::Value {
+        let mut p = payload(None);
+        p["userStatus"]["planStatus"]["weeklyQuotaRemainingPercent"] = 40.into();
+        p["userStatus"]["planStatus"]["weeklyQuotaResetAtUnix"] = 1_800_500_000.into();
+        p
+    }
+
+    #[test]
+    fn valid_reply_with_both_windows_is_read() {
+        let mut p = two_window_payload();
+        p["userStatus"]["planStatus"]["overageBalanceMicros"] = "2500000".into();
+        let d = normalize(&p, "key").unwrap();
+        let windows: Vec<_> = d.windows.iter().map(|w| (w.label, w.used_percent, w.resets_at)).collect();
+        assert_eq!(windows, [("day", 30.0, 1_800_000_000), ("wk", 60.0, 1_800_500_000)]);
+        assert_eq!((d.plan.as_deref(), d.overage_micros), (Some("Pro"), Some(2_500_000)));
+    }
+
+    #[test]
+    fn absent_false_or_null_hide_flag_shows_the_window() {
+        for (label, hidden_field) in [("day", "hideDailyQuota"), ("wk", "hideWeeklyQuota")] {
+            for flag in [None, Some(serde_json::Value::Bool(false)), Some(serde_json::Value::Null)] {
+                let mut p = two_window_payload();
+                if let Some(v) = flag.clone() {
+                    p["userStatus"]["planStatus"]["planInfo"][hidden_field] = v;
+                }
+                let d = normalize(&p, "key").unwrap_or_else(|e| panic!("{hidden_field}: {flag:?}: {}", e.detail));
+                assert!(d.windows.iter().any(|w| w.label == label), "{hidden_field}: {flag:?}");
+                assert_eq!(d.windows.len(), 2, "{hidden_field}: {flag:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn true_hide_flag_hides_the_window() {
+        for (label, hidden_field) in [("day", "hideDailyQuota"), ("wk", "hideWeeklyQuota")] {
+            let mut p = two_window_payload();
+            p["userStatus"]["planStatus"]["planInfo"][hidden_field] = true.into();
+            let d = normalize(&p, "key").unwrap();
+            assert!(d.windows.iter().all(|w| w.label != label), "{hidden_field}");
+            assert_eq!(d.windows.len(), 1, "{hidden_field}");
+        }
+    }
+
+    #[test]
+    fn invalid_hide_flag_is_still_an_error() {
+        for hidden_field in ["hideDailyQuota", "hideWeeklyQuota"] {
+            for bad in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!({})] {
+                let mut p = two_window_payload();
+                p["userStatus"]["planStatus"]["planInfo"][hidden_field] = bad.clone();
+                let err = normalize(&p, "key").err().expect("should fail");
+                assert_eq!(err.code, ErrorCode::Failed, "{hidden_field}: {bad}");
+                assert!(err.detail.contains("visibility"), "{hidden_field}: {bad}: {}", err.detail);
+            }
+        }
+    }
+
+    /// Present reset times that no reply should carry: unparsable or
+    /// non-finite strings, wrong JSON types and negative times.
+    fn unreadable_resets() -> [serde_json::Value; 11] {
+        [
+            serde_json::json!("abc"),
+            "".into(),
+            "NaN".into(),
+            "inf".into(),
+            "-inf".into(),
+            "1.8e9x".into(),
+            true.into(),
+            serde_json::json!({}),
+            serde_json::json!([1_800_000_000]),
+            serde_json::json!(-1),
+            "-1800000000".into(),
+        ]
+    }
+
+    #[test]
+    fn unreadable_reset_time_is_an_error() {
+        for reset_field in ["dailyQuotaResetAtUnix", "weeklyQuotaResetAtUnix"] {
+            for reset in unreadable_resets() {
+                let mut p = two_window_payload();
+                p["userStatus"]["planStatus"][reset_field] = reset.clone();
+                let err = normalize(&p, "key").err().expect("should fail");
+                assert_eq!(err.code, ErrorCode::Failed, "{reset_field}: {reset}");
+                assert!(err.detail.contains("reset time"), "{reset_field}: {reset}: {}", err.detail);
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_reset_of_the_only_window_is_failed_not_no_quota() {
+        for (only, other) in [
+            (
+                ("dailyQuotaResetAtUnix", "dailyQuotaRemainingPercent"),
+                ("weeklyQuotaResetAtUnix", "weeklyQuotaRemainingPercent"),
+            ),
+            (
+                ("weeklyQuotaResetAtUnix", "weeklyQuotaRemainingPercent"),
+                ("dailyQuotaResetAtUnix", "dailyQuotaRemainingPercent"),
+            ),
+        ] {
+            for reset in unreadable_resets() {
+                let mut p = two_window_payload();
+                let status = p["userStatus"]["planStatus"].as_object_mut().unwrap();
+                status.remove(other.0);
+                status.remove(other.1);
+                status.insert(only.0.into(), reset.clone());
+                let err = normalize(&p, "key").err().expect("should fail");
+                assert_eq!(err.code, ErrorCode::Failed, "{}: {reset}", only.0);
+            }
+        }
+    }
+
+    #[test]
+    fn absent_null_or_zero_reset_time_leaves_the_window_out() {
+        for reset_field in ["dailyQuotaResetAtUnix", "weeklyQuotaResetAtUnix"] {
+            for reset in [None, Some(serde_json::Value::Null), Some(0.into()), Some("0".into())] {
+                let mut p = two_window_payload();
+                let status = p["userStatus"]["planStatus"].as_object_mut().unwrap();
+                status.remove(reset_field);
+                if let Some(v) = reset.clone() {
+                    status.insert(reset_field.into(), v);
+                }
+                let d = normalize(&p, "key").unwrap_or_else(|e| panic!("{reset_field}: {reset:?}: {}", e.detail));
+                assert_eq!(d.windows.len(), 1, "{reset_field}: {reset:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_reset_times_at_all_is_no_quota() {
+        let mut p = two_window_payload();
+        let status = p["userStatus"]["planStatus"].as_object_mut().unwrap();
+        status.remove("dailyQuotaResetAtUnix");
+        status.insert("weeklyQuotaResetAtUnix".into(), serde_json::Value::Null);
+        assert_eq!(normalize(&p, "key").err().expect("should fail").code, ErrorCode::NoQuota);
+    }
+
+    #[test]
+    fn absent_or_null_billing_strategy_keeps_the_windows() {
+        for strategy in [None, Some(serde_json::Value::Null)] {
+            let mut p = payload(None);
+            let info = p["userStatus"]["planStatus"]["planInfo"].as_object_mut().unwrap();
+            info.remove("billingStrategy");
+            if let Some(v) = strategy.clone() {
+                info.insert("billingStrategy".into(), v);
+            }
+            let d = normalize(&p, "key").unwrap_or_else(|e| panic!("{strategy:?}: {}", e.detail));
+            assert_eq!(d.windows.len(), 1, "{strategy:?}");
+        }
+    }
+
+    #[test]
+    fn other_billing_strategy_is_no_quota() {
+        let mut p = payload(None);
+        p["userStatus"]["planStatus"]["planInfo"]["billingStrategy"] = "BILLING_STRATEGY_CREDITS".into();
+        assert_eq!(normalize(&p, "key").err().expect("should fail").code, ErrorCode::NoQuota);
+    }
+
+    #[test]
+    fn invalid_billing_strategy_is_an_error() {
+        for bad in [serde_json::json!(1), serde_json::json!(true), serde_json::json!({}), serde_json::json!([])] {
+            let mut p = payload(None);
+            p["userStatus"]["planStatus"]["planInfo"]["billingStrategy"] = bad.clone();
+            let err = normalize(&p, "key").err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{bad}");
+            assert!(err.detail.contains("billing strategy"), "{bad}: {}", err.detail);
         }
     }
 }
