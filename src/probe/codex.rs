@@ -1003,9 +1003,7 @@ mod tests {
     fn kill_tree_kills_a_leader_that_ignores_sigterm() {
         use std::os::unix::process::ExitStatusExt;
         let scratch = Scratch::new("killleader");
-        let ready = scratch.path("ready");
-        let mut child = spawn_group(&format!("trap '' TERM\ntouch {}\nsleep 30", ready.display()));
-        assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
+        let mut child = spawn_sigterm_ignoring_group(&scratch);
         let start = Instant::now();
         kill_tree(&mut child, start + Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
