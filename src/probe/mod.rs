@@ -109,6 +109,9 @@ pub fn unix_now() -> i64 {
 /// (the devin API mixes both). A number must be a whole value in the i64
 /// range (`1.0` is 1); a fraction like `0.5` or a huge value like `1e30`
 /// is `None`, so the caller reports it instead of reading a plausible int.
+/// The check sees the number as serde_json decoded it: a literal past f64
+/// precision is judged after rounding, so `300.00000000000001` reads as 300
+/// and `9.223372036854775807e18` (2^63 as a float) is `None`.
 pub fn json_int(v: &serde_json::Value) -> Option<i64> {
     // 2^63: i64::MIN as f64 is -2^63 exactly, but i64::MAX as f64 rounds up to 2^63, which doesn't fit.
     const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -537,10 +540,22 @@ mod tests {
         ] {
             assert_eq!(json_int(&v), None, "{v}");
         }
-        for text in
-            ["0.5", "-0.5", "1e30", "-1e30", "9.223372036854775807e18", "9223372036854775808", "18446744073709551615"]
-        {
+        for text in ["0.5", "-0.5", "1e30", "-1e30", "9223372036854775808", "18446744073709551615"] {
             assert_eq!(json_int(&serde_json::from_str(text).unwrap()), None, "{text}");
+        }
+    }
+
+    /// serde_json (without `arbitrary_precision`) rounds a float literal to
+    /// f64 before json_int sees it, so a literal past f64 precision is judged
+    /// by its rounded value.
+    #[test]
+    fn json_int_judges_the_decoded_float() {
+        for (text, want) in [
+            ("300.00000000000001", Some(300)),
+            ("-9223372036854775809", Some(i64::MIN)),
+            ("9.223372036854775807e18", None),
+        ] {
+            assert_eq!(json_int(&serde_json::from_str(text).unwrap()), want, "{text}");
         }
     }
 
