@@ -139,19 +139,14 @@ fn exact_int(token: &str) -> Option<i64> {
     }
     // Saturating: an exponent past i64 is far larger than any token's length,
     // so the outcome below (zero, a fraction or out of range) still holds.
-    let exp = match exponent {
+    let exp = match exponent.map(str::parse::<i64>) {
         None => 0,
-        Some(e) => {
-            let (neg, digits) = match e.strip_prefix('-') {
-                Some(digits) => (true, digits),
-                None => (false, e.strip_prefix('+').unwrap_or(e)),
-            };
-            if !all_digits(digits) {
-                return None;
-            }
-            let mag = digits.bytes().fold(0i64, |acc, d| acc.saturating_mul(10).saturating_add(i64::from(d - b'0')));
-            if neg { -mag } else { mag }
-        }
+        Some(Ok(e)) => e,
+        Some(Err(e)) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => return None,
+        },
     };
     // The value is the digit string int + frac times 10^(exp - frac.len()).
     let digits = || int.bytes().chain(frac.bytes());
@@ -172,9 +167,7 @@ fn exact_int(token: &str) -> Option<i64> {
     for d in digits().skip(lead).take(significant) {
         magnitude = magnitude.checked_mul(10)?.checked_add(u64::from(d - b'0'))?;
     }
-    for _ in 0..scale {
-        magnitude = magnitude.checked_mul(10)?;
-    }
+    magnitude = magnitude.checked_mul(10u64.checked_pow(scale as u32)?)?;
     if negative { 0i64.checked_sub_unsigned(magnitude) } else { i64::try_from(magnitude).ok() }
 }
 
