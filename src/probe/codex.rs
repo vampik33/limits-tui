@@ -1397,6 +1397,60 @@ mod tests {
         assert_eq!(windows, [("5h", 1_800_000_000), ("wk", 1_800_500_000)]);
     }
 
+    /// The rate-limits reply to request 1 with a 5h window whose `field` is
+    /// the JSON number `token`, read from the response line's text as the
+    /// probe does.
+    fn raw_window_reply(field: &str, token: &str) -> Result<FetchOk, ProbeError> {
+        let mut w = window(300);
+        w[field] = "RAW-TOKEN".into();
+        let line = serde_json::json!({"id": 1, "result": {"rateLimits": {"primary": w}}}).to_string();
+        let result = response_line(line.replace(r#""RAW-TOKEN""#, token).as_bytes(), 1).expect("the response");
+        normalize(&result.unwrap_or_else(|e| panic!("{field}: {token}: {}", e.detail)))
+    }
+
+    #[test]
+    fn normalize_judges_reset_time_by_its_exact_decimal() {
+        for (token, int) in crate::probe::tests::EDGE_INT_TOKENS {
+            let result = raw_window_reply("resetsAt", token);
+            match int {
+                Some(reset) => {
+                    let d = result.unwrap_or_else(|e| panic!("{token}: {}", e.detail));
+                    assert_eq!(d.windows[0].resets_at, reset, "{token}");
+                }
+                None => {
+                    let err = result.err().expect("should fail");
+                    assert_eq!(err.code, ErrorCode::Failed, "{token}");
+                    assert!(err.detail.contains("unrecognized format"), "{token}: {}", err.detail);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_judges_window_length_by_its_exact_decimal() {
+        for (token, label) in [("3e2", "5h"), ("300.000", "5h"), ("30000e-2", "5h"), ("1.008e4", "wk")] {
+            let d = raw_window_reply("windowDurationMins", token).unwrap_or_else(|e| panic!("{token}: {}", e.detail));
+            assert_eq!(d.windows[0].label, label, "{token}");
+        }
+        let near = ["300.00000000000001", "299.99999999999999", "10080.000000000000001"];
+        for token in near.into_iter().chain(crate::probe::tests::EDGE_INT_TOKENS.map(|(token, _)| token)) {
+            let err = raw_window_reply("windowDurationMins", token).err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{token}");
+            assert!(err.detail.contains("unrecognized format"), "{token}: {}", err.detail);
+        }
+    }
+
+    /// A number past f64's range is read as JSON, so the reply is answered
+    /// (Failed) rather than skipped as not being a response.
+    #[test]
+    fn normalize_percent_past_f64_range_is_failed() {
+        for token in ["1e400", "-1e400"] {
+            let err = raw_window_reply("usedPercent", token).err().expect("should fail");
+            assert_eq!(err.code, ErrorCode::Failed, "{token}");
+            assert!(err.detail.contains("unrecognized format"), "{token}: {}", err.detail);
+        }
+    }
+
     #[test]
     fn normalize_without_rate_limits_object_is_failed() {
         for result in [
