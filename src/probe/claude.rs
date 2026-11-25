@@ -1,7 +1,7 @@
 //! Claude usage: read the capture file written by the claude-limits-tap
 //! statusLine wrapper. Pure file read — no network, no credentials.
 
-use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, unix_now};
+use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, read_small_file, unix_now};
 
 pub const STATE_FILE: &str = ".local/state/herdr-claude-limits/rate_limits.json";
 
@@ -17,7 +17,11 @@ fn window(v: &serde_json::Value, label: &'static str) -> Option<UsageWindow> {
 
 pub fn fetch() -> ProbeResult {
     let path = state_path().ok_or_else(|| ProbeError::new(ErrorCode::Failed, "no home dir"))?;
-    let text = match std::fs::read_to_string(&path) {
+    fetch_from(&path)
+}
+
+fn fetch_from(path: &std::path::Path) -> ProbeResult {
+    let text = match read_small_file(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ProbeError::new(ErrorCode::NoData, "no capture yet"));
@@ -46,6 +50,8 @@ pub fn fetch() -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::MAX_FILE_BYTES;
+    use crate::probe::tests::{Scratch, promptly};
 
     /// The percent of a window read with this `used_percentage`, as bits so
     /// -0.0 and 0.0 differ.
@@ -85,5 +91,47 @@ mod tests {
         ] {
             assert_eq!(percent(used.clone()), Some(f64::to_bits(want)), "{used}");
         }
+    }
+
+    const CAPTURE: &str = r#"{"five_hour":{"used_percentage":1,"resets_at":2}}"#;
+
+    #[test]
+    fn capture_is_read() {
+        let scratch = Scratch::new("capture");
+        let path = scratch.path("rate_limits.json");
+        std::fs::write(&path, CAPTURE).unwrap();
+        assert_eq!(fetch_from(&path).unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn capture_through_a_symlink_is_read() {
+        let scratch = Scratch::new("capturelink");
+        let (target, link) = (scratch.path("target.json"), scratch.path("rate_limits.json"));
+        std::fs::write(&target, CAPTURE).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(fetch_from(&link).unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn missing_capture_is_no_data() {
+        let scratch = Scratch::new("capturemissing");
+        assert_eq!(fetch_from(&scratch.path("rate_limits.json")).err().expect("should fail").code, ErrorCode::NoData);
+    }
+
+    #[test]
+    fn fifo_capture_fails_without_blocking() {
+        let scratch = Scratch::new("capturefifo");
+        let fifo = scratch.fifo("rate_limits.json");
+        let err = promptly(move || fetch_from(&fifo).err()).expect("should fail");
+        assert_eq!(err.code, ErrorCode::Failed, "{}", err.detail);
+    }
+
+    #[test]
+    fn oversized_capture_fails() {
+        let scratch = Scratch::new("capturebig");
+        let path = scratch.path("rate_limits.json");
+        std::fs::write(&path, format!("{CAPTURE}{}", " ".repeat(MAX_FILE_BYTES as usize))).unwrap();
+        let err = fetch_from(&path).err().expect("should fail");
+        assert_eq!(err.code, ErrorCode::Failed, "{}", err.detail);
     }
 }

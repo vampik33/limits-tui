@@ -15,7 +15,9 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 use super::child::run_bounded;
-use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, timeout_from_env, unix_now};
+use super::{
+    ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, read_small_file, timeout_from_env, unix_now,
+};
 
 /// argv[1] that runs limits-tui as the Devin probe's DNS lookup child:
 /// `limits-tui __resolve <host:port> <timeout_ms>`. Internal, not in `--help`.
@@ -89,7 +91,11 @@ fn load_credentials() -> Result<Credentials, ProbeError> {
         .ok()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share/devin/credentials.toml")))
         .ok_or_else(|| ProbeError::new(ErrorCode::Failed, "no home dir"))?;
-    let text = std::fs::read_to_string(&path)
+    read_credentials(&path)
+}
+
+fn read_credentials(path: &std::path::Path) -> Result<Credentials, ProbeError> {
+    let text = read_small_file(path)
         .map_err(|_| ProbeError::new(ErrorCode::NotSignedIn, "credentials file is missing or invalid"))?;
     let creds: toml::Value = toml::from_str(&text)
         .map_err(|_| ProbeError::new(ErrorCode::NotSignedIn, "credentials file is missing or invalid"))?;
@@ -344,6 +350,8 @@ fn normalize(payload: &serde_json::Value, key: &str) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::MAX_FILE_BYTES;
+    use crate::probe::tests::{Scratch, promptly};
     use crate::probe::{SCRIPTS, wait_until};
     use ureq::config::IpFamily;
 
@@ -643,6 +651,42 @@ mod tests {
         assert_eq!(code, 0);
         let first: SocketAddr = out.lines().next().unwrap().parse().unwrap();
         assert!(first.ip().is_loopback() && first.port() == 443, "{out}");
+    }
+
+    const CREDENTIALS: &str = "windsurf_api_key = \"test-key\"\n";
+
+    #[test]
+    fn credentials_are_read() {
+        let scratch = Scratch::new("creds");
+        let path = scratch.path("credentials.toml");
+        std::fs::write(&path, CREDENTIALS).unwrap();
+        assert_eq!(read_credentials(&path).ok().unwrap().api_key, "test-key");
+    }
+
+    #[test]
+    fn credentials_through_a_symlink_are_read() {
+        let scratch = Scratch::new("credslink");
+        let (target, link) = (scratch.path("target.toml"), scratch.path("credentials.toml"));
+        std::fs::write(&target, CREDENTIALS).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_credentials(&link).ok().unwrap().api_key, "test-key");
+    }
+
+    #[test]
+    fn fifo_credentials_fail_without_blocking() {
+        let scratch = Scratch::new("credsfifo");
+        let fifo = scratch.fifo("credentials.toml");
+        let err = promptly(move || read_credentials(&fifo).err()).expect("should fail");
+        assert_eq!(err.code, ErrorCode::NotSignedIn, "{}", err.detail);
+    }
+
+    #[test]
+    fn oversized_credentials_fail() {
+        let scratch = Scratch::new("credsbig");
+        let path = scratch.path("credentials.toml");
+        std::fs::write(&path, format!("{CREDENTIALS}{}", "\n".repeat(MAX_FILE_BYTES as usize))).unwrap();
+        let err = read_credentials(&path).err().expect("should fail");
+        assert_eq!(err.code, ErrorCode::NotSignedIn, "{}", err.detail);
     }
 
     #[test]

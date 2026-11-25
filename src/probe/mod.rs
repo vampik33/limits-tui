@@ -17,6 +17,10 @@ const MAX_TIMEOUT_SECS: f64 = 24.0 * 3600.0;
 #[cfg(test)]
 static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Largest file a probe reads. The Claude capture and the Devin credentials
+/// are well under a kilobyte, so a file past this is not one of them.
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+
 /// One quota/rate-limit window as the UI needs it, normalized across sources.
 pub struct UsageWindow {
     /// Short label for the window: "5h", "day", "wk".
@@ -113,6 +117,25 @@ pub fn json_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// The UTF-8 text of the regular file at `path` (symlinks followed), at most
+/// MAX_FILE_BYTES. It is opened with O_NONBLOCK, so a FIFO there can't block
+/// the caller, and O_NOCTTY, so a terminal there can't become ours; the type
+/// is checked on the open file, so the path can't be swapped after the check.
+pub fn read_small_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(Error::new(ErrorKind::FileTooLarge, "file is larger than 1 MiB"));
+    }
+    String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+}
+
 /// Probe timeout from env var `var` (seconds, may be fractional), else
 /// `default_secs`.
 pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
@@ -142,6 +165,129 @@ fn wait_until(tries: u32, mut cond: impl FnMut() -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-test temp dir, removed on drop.
+    pub(super) struct Scratch(pub(super) std::path::PathBuf);
+
+    impl Scratch {
+        /// A fresh dir only we can use: created here (never one that already
+        /// exists, which another user could have planted in a shared /tmp),
+        /// mode 0700, with a random suffix so planting can't block it either.
+        pub(super) fn new(test: &str) -> Self {
+            use std::hash::BuildHasher;
+            use std::os::unix::fs::DirBuilderExt;
+            let random = std::collections::hash_map::RandomState::new().hash_one(test);
+            let dir = std::env::temp_dir().join(format!("limits-tui-{}-{test}-{random:016x}", std::process::id()));
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            Self(dir)
+        }
+
+        pub(super) fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+
+        /// Make a FIFO `name` and return its path.
+        pub(super) fn fifo(&self, name: &str) -> std::path::PathBuf {
+            use std::os::unix::ffi::OsStrExt;
+            let path = self.path(name);
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_path` is a valid NUL-terminated string for the call.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo {}", path.display());
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `f`'s result, or a panic if it takes more than 5 s (a read that blocks
+    /// fails the test instead of hanging it).
+    pub(super) fn promptly<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(5)).expect("blocked for more than 5 s")
+    }
+
+    #[test]
+    fn small_file_is_read() {
+        let scratch = Scratch::new("readok");
+        let path = scratch.path("f");
+        std::fs::write(&path, "héllo\n").unwrap();
+        assert_eq!(read_small_file(&path).unwrap(), "héllo\n");
+    }
+
+    #[test]
+    fn symlink_to_a_regular_file_is_read() {
+        let scratch = Scratch::new("readlink");
+        let (target, link) = (scratch.path("target"), scratch.path("link"));
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_small_file(&link).unwrap(), "{}");
+    }
+
+    #[test]
+    fn missing_file_is_not_found() {
+        let scratch = Scratch::new("readmissing");
+        assert_eq!(read_small_file(&scratch.path("nope")).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let scratch = Scratch::new("readfifo");
+        let fifo = scratch.fifo("fifo");
+        let err = promptly(move || read_small_file(&fifo)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn symlink_to_a_fifo_is_refused_without_blocking() {
+        let scratch = Scratch::new("readfifolink");
+        let link = scratch.path("link");
+        std::os::unix::fs::symlink(scratch.fifo("fifo"), &link).unwrap();
+        let err = promptly(move || read_small_file(&link)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn directory_is_refused() {
+        let scratch = Scratch::new("readdir");
+        assert!(read_small_file(&scratch.0).is_err());
+    }
+
+    #[test]
+    fn character_device_is_refused() {
+        let err = promptly(|| read_small_file(std::path::Path::new("/dev/null"))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn file_at_the_size_cap_is_read() {
+        let scratch = Scratch::new("readcap");
+        let path = scratch.path("f");
+        std::fs::write(&path, "a".repeat(MAX_FILE_BYTES as usize)).unwrap();
+        assert_eq!(read_small_file(&path).unwrap().len() as u64, MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn file_over_the_size_cap_is_refused() {
+        let scratch = Scratch::new("readbig");
+        let path = scratch.path("f");
+        std::fs::write(&path, "a".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
+        assert_eq!(read_small_file(&path).unwrap_err().kind(), std::io::ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn invalid_utf8_is_an_error() {
+        let scratch = Scratch::new("readutf8");
+        let path = scratch.path("f");
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        assert_eq!(read_small_file(&path).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn detail_two_byte_char_crossing_limit_is_dropped() {
