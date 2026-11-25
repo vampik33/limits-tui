@@ -68,10 +68,11 @@ quick() {
 
 pane() { tmux -S "$sock" display -p -t v "$1" 2>/dev/null; }
 
-# Prints how the dead pane's app exited: its exit status, or "signal N". Ubuntu's tmux 3.4 is built
-# with libutempter, which sets SIGCHLD to SIG_DFL while its helper runs as a pane closes; an app that
-# exits in that window is never reaped, so tmux has no status for it until another child exits
-# (tmux/tmux#4559, fixed in tmux 3.6). Sending the server SIGCHLD makes it reap and record it.
+# Prints how the dead pane's app exited: its exit status, "signal N", or "unknown". Ubuntu's tmux
+# 3.4 is built with libutempter, which sets SIGCHLD to SIG_DFL while its helper runs as a pane
+# closes; an app that exits in that window is never reaped, so tmux has no status for it until
+# another child exits (tmux/tmux#4559, fixed in tmux 3.6). Sending the server SIGCHLD makes it reap
+# and record it.
 dead_status() {
   local i status signal
   for ((i = 0; i < 20; i++)); do
@@ -84,10 +85,10 @@ dead_status() {
       echo "signal $signal"
       return 0
     fi
-    kill -CHLD "$(tmux -S "$sock" display -p '#{pid}' 2>/dev/null)" 2>/dev/null || true
+    kill -CHLD "$(pane '#{pid}')" 2>/dev/null || true
     sleep 0.1
   done
-  return 1
+  echo unknown
 }
 
 # Waits until the pane shows every pattern given (fixed strings), up to 20 s.
@@ -100,7 +101,7 @@ wait_for_screen() { # $1 = capture file, rest = patterns
     for p in "$@"; do grep -qF -- "$p" "$file" || missing="$missing [$p]"; done
     [ -z "$missing" ] && return 0
     if [ "$(pane '#{pane_dead}')" = 1 ]; then
-      echo "the app exited (status $(dead_status || echo unknown)) before drawing:$missing"
+      echo "the app exited (status $(dead_status)) before drawing:$missing"
       cat "$file"
       return 1
     fi
@@ -146,7 +147,7 @@ tui() {
   done
   [ "$(pane '#{pane_dead}')" = 1 ] || fail tui "$log" "still running 5 s after q"
   tmux -S "$sock" capture-pane -p -t v >"$out/screen-exit.txt" 2>/dev/null || true
-  status=$(dead_status) || status=unknown
+  status=$(dead_status)
   if [ "$status" != 0 ]; then
     cat "$out/screen-exit.txt" >>"$log"
     fail tui "$log" "exit status $status after q"
