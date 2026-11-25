@@ -847,18 +847,21 @@ mod tests {
         assert!(codex_from_login_output(b"", None).is_none());
     }
 
+    /// The PATH app_server_command sets with our PATH `ours`: None if the
+    /// child inherits ours.
+    fn path_env(codex: &CodexBin, ours: &str) -> Option<Option<std::ffi::OsString>> {
+        app_server_command(codex, Some(ours.as_ref()))
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+    }
+
     #[test]
     fn app_server_command_sets_path_only_when_needed() {
-        let path_env = |codex: &CodexBin| {
-            app_server_command(codex, Some("/usr/bin:/bin".as_ref()))
-                .get_envs()
-                .find(|(k, _)| *k == "PATH")
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
-        };
         let plain = CodexBin { path: "/usr/bin/codex".into(), child_path: None };
-        assert_eq!(path_env(&plain), None);
+        assert_eq!(path_env(&plain, "/usr/bin:/bin"), None);
         let shell = CodexBin { path: "/n/bin/codex".into(), child_path: Some("/n/bin:/usr/bin".into()) };
-        assert_eq!(path_env(&shell), Some(Some("/n/bin:/usr/bin".into())));
+        assert_eq!(path_env(&shell, "/usr/bin:/bin"), Some(Some("/n/bin:/usr/bin".into())));
         let cmd = app_server_command(&shell, Some("/usr/bin:/bin".as_ref()));
         assert_eq!(cmd.get_program(), "/n/bin/codex");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["app-server"]);
@@ -874,12 +877,6 @@ mod tests {
 
     #[test]
     fn app_server_command_drops_empty_and_relative_path_entries() {
-        let path_env = |codex: &CodexBin, ours: &str| {
-            app_server_command(codex, Some(ours.as_ref()))
-                .get_envs()
-                .find(|(k, _)| *k == "PATH")
-                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
-        };
         let plain = CodexBin { path: "/usr/bin/codex".into(), child_path: None };
         assert_eq!(path_env(&plain, ".::tmp/bin:/usr/bin:"), Some(Some("/usr/bin".into())));
         let shell = CodexBin { path: "/n/bin/codex".into(), child_path: Some(":/n/bin:tmp/bin:.:/usr/bin".into()) };

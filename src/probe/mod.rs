@@ -527,14 +527,11 @@ mod tests {
     #[test]
     fn safe_path_matches_a_naive_filter() {
         let pool = ["", ".", "..", "tmp/bin", "~/bin", "/usr/bin", "/a b/", "/"];
-        let mut paths: Vec<Vec<&str>> = pool.iter().map(|e| vec![*e]).collect();
-        for _ in 1..4 {
-            let longer: Vec<Vec<&str>> = paths
-                .iter()
-                .filter(|p| p.len() == paths.last().unwrap().len())
-                .flat_map(|p| pool.iter().map(move |e| [p.as_slice(), &[*e]].concat()))
-                .collect();
-            paths.extend(longer);
+        let mut paths: Vec<Vec<&str>> = Vec::new();
+        let mut longest: Vec<Vec<&str>> = vec![Vec::new()];
+        for _ in 0..4 {
+            longest = longest.iter().flat_map(|p| pool.iter().map(move |e| [p.as_slice(), &[*e]].concat())).collect();
+            paths.extend(longest.iter().cloned());
         }
         assert_eq!(paths.len(), 8 + 64 + 512 + 4096);
         for entries in paths {
