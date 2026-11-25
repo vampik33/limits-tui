@@ -11,7 +11,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::child::{Pipe, has_exited, run_bounded};
-use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, json_int, timeout_from_env, unix_now};
+use super::{
+    ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, absolute_dirs, inherit_safe_path, json_f64, json_int,
+    safe_path, timeout_from_env, unix_now,
+};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 /// Printed by the login-shell lookup before its answer, so the login config's
@@ -39,14 +42,22 @@ fn is_exe(p: &std::path::Path) -> bool {
 
 /// The last OUTPUT_CAP bytes of stdout of `shell -lc`, printing LOGIN_MARKER,
 /// the exported PATH (an empty line if unset) and `command -v codex`, or None
-/// if the shell could not be started. Bounded by `shell_deadline` as
+/// if the shell could not be started. The shell inherits `ours` (our PATH)
+/// as inherit_safe_path leaves it. Bounded by `shell_deadline` as
 /// `run_bounded` describes; that includes background jobs the login config
 /// leaves in the shell's process group.
-fn login_shell_lookup(shell: &std::ffi::OsStr, shell_deadline: Instant) -> Option<Vec<u8>> {
+fn login_shell_lookup(
+    shell: &std::ffi::OsStr,
+    ours: Option<&std::ffi::OsStr>,
+    shell_deadline: Instant,
+) -> Option<Vec<u8>> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
     let lookup = format!("printf '%s\\n' '{LOGIN_MARKER}'; printenv PATH || echo; command -v codex");
-    run_bounded(Command::new(shell).args(["-lc", &lookup]), shell_deadline)
+    let mut command = Command::new(shell);
+    command.args(["-lc", &lookup]);
+    inherit_safe_path(&mut command, ours);
+    run_bounded(&mut command, shell_deadline)
 }
 
 /// `dir` followed by `current` (a PATH value), skipping an empty `current`:
@@ -63,7 +74,8 @@ fn path_with(dir: &std::path::Path, current: Option<std::ffi::OsString>) -> std:
 /// CODEX_BIN, else PATH, else the login shell's PATH (desktop launches may
 /// lack it) — same order as the Python probe. Our working directory may be an
 /// untrusted checkout: codex_on_path keeps this lookup out of it, and running
-/// the children in `/` keeps their own lookups out of it.
+/// the children in `/` with only absolute PATH entries keeps their own
+/// lookups out of it and out of `/`.
 fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(override_) = std::env::var("CODEX_BIN") {
         return codex_from_override(&override_);
@@ -74,7 +86,7 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Ok(shell) = std::env::var("SHELL") {
         // The login shell may source slow config; bound it like the Python probe.
         let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
-        if let Some(stdout) = login_shell_lookup(shell.as_ref(), shell_deadline)
+        if let Some(stdout) = login_shell_lookup(shell.as_ref(), std::env::var_os("PATH").as_deref(), shell_deadline)
             && let Some(codex) = codex_from_login_output(&stdout, std::env::var_os("PATH"))
         {
             return Ok(codex);
@@ -95,11 +107,7 @@ fn codex_from_override(value: &str) -> Result<CodexBin, ProbeError> {
 /// The first executable `codex` in the absolute dirs of `path` (a PATH value).
 /// Empty and relative entries are skipped: they name the working directory.
 fn codex_on_path(path: &str) -> Option<std::path::PathBuf> {
-    path.split(':')
-        .map(std::path::Path::new)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("codex"))
-        .find(|p| is_exe(p))
+    absolute_dirs(path.as_ref()).map(|dir| dir.join("codex")).find(|p| is_exe(p))
 }
 
 /// Codex as found by login_shell_lookup: what follows the last LOGIN_MARKER
@@ -128,10 +136,11 @@ fn codex_from_login_output(stdout: &[u8], current: Option<std::ffi::OsString>) -
 }
 
 /// `codex app-server` with piped stdio, in its own process group so kill_tree
-/// can take down npm-shim children. It runs in `/`, so empty or relative
-/// entries of the PATH it inherits can't resolve the shim's `node`, or what
-/// codex itself starts, to programs in our working directory.
-fn app_server_command(codex: &CodexBin) -> Command {
+/// can take down npm-shim children. It runs in `/` with only the absolute
+/// entries of its PATH (codex's `child_path`, else `ours`, our PATH), so the
+/// shim's `node`, or what codex itself starts, can't resolve to a program in
+/// our working directory or in a directory under `/` such as `tmp/bin`.
+fn app_server_command(codex: &CodexBin, ours: Option<&std::ffi::OsStr>) -> Command {
     let mut command = Command::new(&codex.path);
     command
         .arg("app-server")
@@ -140,8 +149,11 @@ fn app_server_command(codex: &CodexBin) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
-    if let Some(path) = &codex.child_path {
-        command.env("PATH", path);
+    match &codex.child_path {
+        Some(path) => {
+            command.env("PATH", safe_path(path));
+        }
+        None => inherit_safe_path(&mut command, ours),
     }
     command
 }
@@ -371,7 +383,7 @@ pub fn fetch() -> ProbeResult {
 /// Ask `codex app-server` for the account's rate limits, by `deadline`, then
 /// stop it.
 fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
-    let mut child = app_server_command(codex)
+    let mut child = app_server_command(codex, std::env::var_os("PATH").as_deref())
         .spawn()
         .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
 
@@ -446,7 +458,7 @@ mod tests {
     fn lookup(shell: &std::path::Path, budget: Duration) -> (Option<Vec<u8>>, Duration) {
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
-        let out = login_shell_lookup(shell.as_os_str(), start + budget);
+        let out = login_shell_lookup(shell.as_os_str(), std::env::var_os("PATH").as_deref(), start + budget);
         (out, start.elapsed())
     }
 
@@ -838,7 +850,7 @@ mod tests {
     #[test]
     fn app_server_command_sets_path_only_when_needed() {
         let path_env = |codex: &CodexBin| {
-            app_server_command(codex)
+            app_server_command(codex, Some("/usr/bin:/bin".as_ref()))
                 .get_envs()
                 .find(|(k, _)| *k == "PATH")
                 .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
@@ -847,7 +859,7 @@ mod tests {
         assert_eq!(path_env(&plain), None);
         let shell = CodexBin { path: "/n/bin/codex".into(), child_path: Some("/n/bin:/usr/bin".into()) };
         assert_eq!(path_env(&shell), Some(Some("/n/bin:/usr/bin".into())));
-        let cmd = app_server_command(&shell);
+        let cmd = app_server_command(&shell, Some("/usr/bin:/bin".as_ref()));
         assert_eq!(cmd.get_program(), "/n/bin/codex");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["app-server"]);
     }
@@ -856,8 +868,76 @@ mod tests {
     fn app_server_command_runs_in_root() {
         for child_path in [None, Some("/n/bin:/usr/bin".into())] {
             let codex = CodexBin { path: "/n/bin/codex".into(), child_path };
-            assert_eq!(app_server_command(&codex).get_current_dir(), Some(std::path::Path::new("/")));
+            assert_eq!(app_server_command(&codex, None).get_current_dir(), Some(std::path::Path::new("/")));
         }
+    }
+
+    #[test]
+    fn app_server_command_drops_empty_and_relative_path_entries() {
+        let path_env = |codex: &CodexBin, ours: &str| {
+            app_server_command(codex, Some(ours.as_ref()))
+                .get_envs()
+                .find(|(k, _)| *k == "PATH")
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        let plain = CodexBin { path: "/usr/bin/codex".into(), child_path: None };
+        assert_eq!(path_env(&plain, ".::tmp/bin:/usr/bin:"), Some(Some("/usr/bin".into())));
+        let shell = CodexBin { path: "/n/bin/codex".into(), child_path: Some(":/n/bin:tmp/bin:.:/usr/bin".into()) };
+        assert_eq!(path_env(&shell, "/usr/bin"), Some(Some("/n/bin:/usr/bin".into())));
+        let relative = CodexBin { path: "/n/bin/codex".into(), child_path: Some("tmp/bin:".into()) };
+        assert_eq!(path_env(&relative, "/usr/bin"), Some(Some(crate::probe::FALLBACK_PATH.into())));
+    }
+
+    /// `path` (absolute) spelled relative to `/`, where the children run.
+    fn relative_to_root(path: &std::path::Path) -> String {
+        path.strip_prefix("/").unwrap().display().to_string()
+    }
+
+    /// What `codex app-server` as app_server_command starts it prints, by 5 s.
+    fn run_app_server(codex: &CodexBin, ours: &str) -> Vec<u8> {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let mut command = app_server_command(codex, Some(ours.as_ref()));
+        run_bounded(&mut command, Instant::now() + Duration::from_secs(5)).unwrap()
+    }
+
+    #[test]
+    fn app_server_cannot_run_a_program_found_only_through_a_relative_path_entry() {
+        let scratch = Scratch::new("relshim");
+        let shim = scratch.script("npmg/codex", "#!/usr/bin/env fakenode\n");
+        scratch.script("node/fakenode", "#!/bin/sh\necho ran-by-fakenode\n");
+        let node = scratch.path("node");
+        // From `/`, where the child runs, this names the node dir, as `tmp/bin`
+        // names `/tmp/bin`.
+        let relative = format!("{}:/usr/bin:/bin", relative_to_root(&node));
+        let absolute = format!("{}:/usr/bin:/bin", node.display());
+        let login = |path: &str| CodexBin { path: shim.clone(), child_path: Some(path.into()) };
+        let plain = CodexBin { path: shim.clone(), child_path: None };
+        // The shim finds fakenode through an absolute entry of the login PATH,
+        // but not through the relative one.
+        assert_eq!(run_app_server(&login(&absolute), "/usr/bin:/bin"), b"ran-by-fakenode\n");
+        assert_eq!(run_app_server(&login(&relative), "/usr/bin:/bin"), b"");
+        // The same with ours. It gets a trailing empty entry so that PATH is
+        // set, not left to inherit the test's own.
+        assert_eq!(run_app_server(&plain, &format!("{absolute}:")), b"ran-by-fakenode\n");
+        assert_eq!(run_app_server(&plain, &relative), b"");
+    }
+
+    #[test]
+    fn login_shell_cannot_run_a_program_found_only_through_a_relative_path_entry() {
+        let scratch = Scratch::new("relshell");
+        scratch.script("node/fakenode", "#!/bin/sh\necho ran-by-fakenode\n");
+        let node = scratch.path("node");
+        let shell = scratch.shell("printf '%s\\n' \"$PATH\"; fakenode || echo not-found");
+        let run = |ours: &str| {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            login_shell_lookup(shell.as_os_str(), Some(ours.as_ref()), Instant::now() + Duration::from_secs(5)).unwrap()
+        };
+        let relative = format!(".::{}:/usr/bin:/bin:", relative_to_root(&node));
+        assert_eq!(run(&relative), b"/usr/bin:/bin\nnot-found\n");
+        // Found through an absolute entry. A trailing empty entry, so that PATH
+        // is set, not left to inherit the test's own.
+        let absolute = format!("{}:/usr/bin:/bin", node.display());
+        assert_eq!(run(&format!("{absolute}:")), format!("{absolute}\nran-by-fakenode\n").as_bytes());
     }
 
     // --- kill_tree ---

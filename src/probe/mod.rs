@@ -21,6 +21,12 @@ static SCRIPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// are well under a kilobyte, so a file past this is not one of them.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+/// A child's PATH when the one it would get has no absolute entry (or none is
+/// set): `getconf PATH`. An empty PATH is itself an empty entry, the child's
+/// working directory, and with PATH unset the program the child runs picks its
+/// own default (upstream bash's ends in `.`).
+const FALLBACK_PATH: &str = "/bin:/usr/bin";
+
 /// One quota/rate-limit window as the UI needs it, normalized across sources.
 pub struct UsageWindow {
     /// Short label for the window: "5h", "day", "wk".
@@ -147,6 +153,29 @@ pub fn timeout_from_env(var: &str, default_secs: f64) -> Duration {
 fn parse_timeout(raw: Option<&str>, default_secs: f64) -> Duration {
     let secs = raw.and_then(|s| s.parse::<f64>().ok()).filter(|t| !t.is_nan()).unwrap_or(default_secs);
     Duration::from_secs_f64(secs.clamp(0.001, MAX_TIMEOUT_SECS))
+}
+
+/// The absolute entries of `path` (a PATH value). Empty and relative entries
+/// are resolved against the working directory: ours may be an untrusted
+/// checkout, and under a child's (`/`) `tmp/bin` is `/tmp/bin`, which any
+/// local user can create.
+fn absolute_dirs(path: &std::ffi::OsStr) -> impl Iterator<Item = std::path::PathBuf> + '_ {
+    std::env::split_paths(path).filter(|dir| dir.is_absolute())
+}
+
+/// The PATH to give a child for `path` (a PATH value): its absolute entries,
+/// or FALLBACK_PATH if it has none.
+fn safe_path(path: &std::ffi::OsStr) -> std::ffi::OsString {
+    std::env::join_paths(absolute_dirs(path)).ok().filter(|p| !p.is_empty()).unwrap_or_else(|| FALLBACK_PATH.into())
+}
+
+/// Leave `cmd` to inherit `ours` (our PATH, None if unset) if safe_path keeps
+/// it as it is; otherwise set PATH to what safe_path makes of it.
+fn inherit_safe_path(cmd: &mut std::process::Command, ours: Option<&std::ffi::OsStr>) {
+    let safe = safe_path(ours.unwrap_or_default());
+    if ours != Some(safe.as_os_str()) {
+        cmd.env("PATH", safe);
+    }
 }
 
 /// Whether `cond` holds within `tries` checks 50 ms apart. Shared by every
@@ -459,5 +488,78 @@ mod tests {
         }
         // The cap leaves room to build a deadline from it.
         let _ = std::time::Instant::now() + parse_timeout(Some("inf"), 15.0);
+    }
+
+    // --- PATH for children ---
+
+    #[test]
+    fn safe_path_keeps_only_absolute_entries() {
+        for (path, want) in [
+            ("/usr/bin:/bin", "/usr/bin:/bin"),
+            (":/usr/bin", "/usr/bin"),
+            ("/usr/bin:", "/usr/bin"),
+            ("/usr/bin::/bin", "/usr/bin:/bin"),
+            (".:/usr/bin:tmp/bin:/bin:..", "/usr/bin:/bin"),
+            ("~/bin:./bin:/opt/x/", "/opt/x/"),
+        ] {
+            assert_eq!(safe_path(path.as_ref()), want, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_without_an_absolute_entry_falls_back() {
+        for path in ["", ":", "::", ".", "tmp/bin", ".:tmp/bin:", "bin::.."] {
+            assert_eq!(safe_path(path.as_ref()), FALLBACK_PATH, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_keeps_non_utf8_entries() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::OsStr::from_bytes(b"/opt/\xff/bin:rel\xfe:/bin");
+        assert_eq!(safe_path(path).as_bytes(), b"/opt/\xff/bin:/bin");
+        assert_eq!(safe_path(std::ffi::OsStr::from_bytes(b"\xff:.")), FALLBACK_PATH);
+    }
+
+    /// Every PATH of one to four entries from a small pool: safe_path keeps
+    /// exactly the entries that start with `/`, in order, falls back when
+    /// there are none, and changes nothing the second time.
+    #[test]
+    fn safe_path_matches_a_naive_filter() {
+        let pool = ["", ".", "..", "tmp/bin", "~/bin", "/usr/bin", "/a b/", "/"];
+        let mut paths: Vec<Vec<&str>> = pool.iter().map(|e| vec![*e]).collect();
+        for _ in 1..4 {
+            let longer: Vec<Vec<&str>> = paths
+                .iter()
+                .filter(|p| p.len() == paths.last().unwrap().len())
+                .flat_map(|p| pool.iter().map(move |e| [p.as_slice(), &[*e]].concat()))
+                .collect();
+            paths.extend(longer);
+        }
+        assert_eq!(paths.len(), 8 + 64 + 512 + 4096);
+        for entries in paths {
+            let path = entries.join(":");
+            let kept: Vec<&str> = entries.iter().copied().filter(|e| e.starts_with('/')).collect();
+            let want = if kept.is_empty() { FALLBACK_PATH.to_string() } else { kept.join(":") };
+            let safe = safe_path(path.as_ref());
+            assert_eq!(safe, want.as_str(), "{path:?}");
+            assert_eq!(safe_path(&safe), safe, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn inherit_safe_path_sets_path_only_when_needed() {
+        let set = |ours: Option<&str>| {
+            let mut cmd = std::process::Command::new("/bin/true");
+            inherit_safe_path(&mut cmd, ours.map(std::ffi::OsStr::new));
+            cmd.get_envs().find(|(k, _)| *k == "PATH").map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        assert_eq!(set(Some("/usr/bin:/bin")), None);
+        assert_eq!(set(Some("/usr/bin:tmp/bin")), Some(Some("/usr/bin".into())));
+        assert_eq!(set(Some("/usr/bin:")), Some(Some("/usr/bin".into())));
+        assert_eq!(set(Some(".:/usr/bin")), Some(Some("/usr/bin".into())));
+        for ours in [Some(""), Some("tmp/bin"), Some(":."), None] {
+            assert_eq!(set(ours), Some(Some(FALLBACK_PATH.into())), "{ours:?}");
+        }
     }
 }

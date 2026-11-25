@@ -16,7 +16,8 @@ use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 use super::child::run_bounded;
 use super::{
-    ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_int, read_small_file, timeout_from_env, unix_now,
+    ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, inherit_safe_path, json_int, read_small_file,
+    timeout_from_env, unix_now,
 };
 
 /// argv[1] that runs limits-tui as the Devin probe's DNS lookup child:
@@ -45,6 +46,9 @@ struct ChildResolver {
     /// Put before `RESOLVE_ARG`: tests run `/bin/sh -c <script>` as the child.
     args: Vec<String>,
     deadline: Instant,
+    /// Our PATH (None if unset), which the child inherits as
+    /// inherit_safe_path leaves it.
+    path: Option<OsString>,
 }
 
 impl Resolver for ChildResolver {
@@ -67,6 +71,7 @@ impl Resolver for ChildResolver {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args).args([RESOLVE_ARG, &host_port, &millis.to_string()]);
         die_with_parent(&mut cmd);
+        inherit_safe_path(&mut cmd, self.path.as_deref());
         let output = run_bounded(&mut cmd, end).unwrap_or_default();
         if Instant::now() >= end {
             return Err(ureq::Error::Timeout(timeout.reason));
@@ -167,12 +172,13 @@ pub fn fetch() -> ProbeResult {
     })?;
     // ureq's default proxy setting: tests pass None to stay off the environment's.
     let proxy = ureq::Proxy::try_from_env();
-    let mut response = agent(ChildResolver { program, args: Vec::new(), deadline }, proxy)
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Connect-Protocol-Version", "1")
-        .send(body.to_string())
-        .map_err(map_error)?;
+    let mut response =
+        agent(ChildResolver { program, args: Vec::new(), deadline, path: std::env::var_os("PATH") }, proxy)
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .send(body.to_string())
+            .map_err(map_error)?;
 
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().map_err(|e| ProbeError::new(ErrorCode::Failed, e.to_string()))?;
@@ -377,6 +383,7 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into(), "sh".into()],
             deadline: Instant::now() + budget,
+            path: std::env::var_os("PATH"),
         }
     }
 
@@ -449,11 +456,32 @@ mod tests {
     }
 
     #[test]
+    fn lookup_child_gets_only_absolute_path_entries() {
+        // The child answers only if it got the PATH it should.
+        let answer_if = |path: &str| format!("[ \"$PATH\" = {path} ] && echo 192.0.2.1:443");
+        let cases = [
+            (Some(".::tmp/bin:/usr/bin:/bin:"), "/usr/bin:/bin"),
+            (Some("tmp/bin:."), crate::probe::FALLBACK_PATH),
+            (Some(""), crate::probe::FALLBACK_PATH),
+            (None, crate::probe::FALLBACK_PATH),
+        ];
+        for (ours, want) in cases {
+            let resolver = ChildResolver {
+                path: ours.map(OsString::from),
+                ..sh_resolver(&answer_if(want), Duration::from_secs(5))
+            };
+            let got = resolve_uri(&resolver, "https://example.com/", &Config::default());
+            assert_eq!(got.ok(), Some(addrs(&["192.0.2.1:443"])), "{ours:?}");
+        }
+    }
+
+    #[test]
     fn child_resolver_missing_program_could_not_connect() {
         let resolver = ChildResolver {
             program: "/nonexistent/limits-tui".into(),
             args: Vec::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            path: std::env::var_os("PATH"),
         };
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
         assert!(matches!(err, ureq::Error::Io(_)), "{err}");
