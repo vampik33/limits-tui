@@ -227,7 +227,7 @@ fn main() -> std::io::Result<()> {
              Keys: r refresh all · q / Esc / Ctrl-C quit\n\
              \n\
              Runs fine over SSH. Env: CODEX_BIN, CODEX_LIMITS_TIMEOUT,\n\
-             DEVIN_CREDENTIALS, DEVIN_LIMITS_TIMEOUT, CLAUDE_CONFIG_DIR."
+             DEVIN_CREDENTIALS, DEVIN_LIMITS_TIMEOUT."
         );
         return Ok(());
     }
