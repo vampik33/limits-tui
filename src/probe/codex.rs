@@ -472,8 +472,8 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
 mod tests {
     use super::*;
 
-    use crate::probe::child::{REAP_WAIT, run_bounded};
-    use crate::probe::tests::{is_our_zombie, promptly};
+    use crate::probe::child::{REAP_WAIT, hold_next_reap, run_bounded};
+    use crate::probe::tests::{is_our_zombie, observe_exit, promptly, unreaped_exit_status};
     use crate::probe::{SCRIPTS, wait_until};
 
     /// Per-test temp dir, removed on drop.
@@ -1007,6 +1007,50 @@ mod tests {
 
     // --- kill_tree ---
 
+    /// `kill_tree(child, deadline)`, and how the child ended, whether
+    /// kill_tree reaped it or, the child taking longer than REAP_WAIT to exit
+    /// (a busy machine), left it to a reaper thread. The reap is held until the
+    /// status has been read from the exited child (`observe_exit`), so
+    /// neither reap can take it first; the status kill_tree returns, if any,
+    /// must be that one. A child that exited well inside REAP_WAIT before
+    /// kill_tree returned (as the observer saw it: seen late, it only counts
+    /// as later) must have been reaped by kill_tree itself.
+    fn kill_tree_status(child: Child, deadline: Instant) -> ExitStatus {
+        let (returned, observed, exited_at, returned_at) = kill_tree_and_status(child, deadline);
+        if returned.is_none() {
+            let early = returned_at.saturating_duration_since(exited_at);
+            assert!(
+                early < REAP_WAIT / 2,
+                "left a child that exited {early:?} before kill_tree returned to a reaper thread"
+            );
+        }
+        observed
+    }
+
+    /// `kill_tree_status` without the check that a child exiting in time was
+    /// reaped by kill_tree, with what kill_tree returned, when the observer
+    /// saw the child exit and when kill_tree returned.
+    fn kill_tree_and_status(child: Child, deadline: Instant) -> (Option<ExitStatus>, ExitStatus, Instant, Instant) {
+        let pid = child.id() as libc::pid_t;
+        assert!(pid > 1, "bad pid {pid}");
+        let exit = observe_exit(move || Some(pid), CHILDREN.hold_reap(pid as u32));
+        let start = Instant::now();
+        let returned = kill_tree(child, deadline);
+        let returned_at = Instant::now();
+        let elapsed = returned_at - start;
+        // A child that never exits fails the test instead of hanging it; the
+        // observer keeps its reap held until the child does exit.
+        let (observed, exited_at) = exit
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child never exited")
+            .expect("the child could not be waited on");
+        match returned {
+            Some(returned) => assert_eq!(returned, observed, "kill_tree returned another status"),
+            None => assert!(elapsed >= REAP_WAIT, "left the reap to a reaper thread after {elapsed:?}"),
+        }
+        (returned, observed, exited_at, returned_at)
+    }
+
     fn spawn_group(script: &str) -> Child {
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
         Command::new("/bin/sh")
@@ -1039,10 +1083,10 @@ mod tests {
         let scratch = Scratch::new("killleader");
         let child = spawn_sigterm_ignoring_group(&scratch);
         let start = Instant::now();
-        let status = kill_tree(child, start + Duration::from_secs(10));
+        let status = kill_tree_status(child, start + Duration::from_secs(10));
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
         // SIGTERM was ignored, so only the SIGKILL can have ended it.
-        assert_eq!(status.expect("not reaped").signal(), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[test]
@@ -1069,10 +1113,10 @@ mod tests {
         let scratch = Scratch::new("killnow");
         let child = spawn_sigterm_ignoring_group(&scratch);
         let start = Instant::now();
-        let status = kill_tree(child, start);
+        let status = kill_tree_status(child, start);
         // The SIGTERM grace alone would take a second.
         assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
-        assert_eq!(status.expect("not reaped").signal(), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[test]
@@ -1081,9 +1125,10 @@ mod tests {
         let scratch = Scratch::new("killlate");
         let child = spawn_sigterm_ignoring_group(&scratch);
         let start = Instant::now();
-        let status = kill_tree(child, start.checked_sub(Duration::from_secs(5)).expect("the clock started 5 s ago"));
+        let status =
+            kill_tree_status(child, start.checked_sub(Duration::from_secs(5)).expect("the clock started 5 s ago"));
         assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
-        assert_eq!(status.expect("not reaped").signal(), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[test]
@@ -1093,11 +1138,11 @@ mod tests {
         let child = spawn_sigterm_ignoring_group(&scratch);
         let start = Instant::now();
         let grace = Duration::from_millis(300);
-        let status = kill_tree(child, start + grace);
+        let status = kill_tree_status(child, start + grace);
         let elapsed = start.elapsed();
         assert!(elapsed >= grace, "cut the grace short, after {elapsed:?}");
         assert!(elapsed < grace + Duration::from_millis(500), "took {elapsed:?}");
-        assert_eq!(status.expect("not reaped").signal(), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     /// A leader SIGKILL can't end (held as if in uninterruptible sleep) holds
@@ -1133,7 +1178,9 @@ mod tests {
         // Checked before the release, asserted after: a failed check must not
         // leave the reaper waiting.
         let recorded = CHILDREN.contains(pid);
-        let unreaped = is_our_zombie(pid as libc::pid_t);
+        // Exited, however long a busy machine takes SIGKILL to end it, and
+        // still unreaped while held.
+        let unreaped = wait_until(200, || is_our_zombie(pid as libc::pid_t));
         drop(release);
         assert_eq!(status, None, "a held leader was reaped");
         assert!(elapsed >= REAP_WAIT, "gave up after {elapsed:?}");
@@ -1152,8 +1199,65 @@ mod tests {
         // the grace would cut its trap short.
         let child = spawn_group(&format!("trap 'sleep 0.2; exit 3' TERM\ntouch {}\nsleep 30 &\nwait", ready.display()));
         assert!(wait_until(40, || ready.exists()), "the shell never installed its trap");
-        let status = kill_tree(child, Instant::now() + Duration::from_secs(10));
-        assert_eq!(status.expect("not reaped").code(), Some(3), "the SIGTERM trap did not finish");
+        let status = kill_tree_status(child, Instant::now() + Duration::from_secs(10));
+        assert_eq!(status.code(), Some(3), "the SIGTERM trap did not finish");
+    }
+
+    #[test]
+    fn unreaped_exit_status_reads_how_a_child_ended_without_reaping_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut killed = spawn_group("exec sleep 30");
+        let mut exited = spawn_group("exit 3");
+        let (killed_pid, exited_pid) = (killed.id() as libc::pid_t, exited.id() as libc::pid_t);
+        assert!(killed_pid > 1 && exited_pid > 1, "bad pids {killed_pid}, {exited_pid}");
+        let running = unreaped_exit_status(killed_pid);
+        // SAFETY: kill only sends a signal. `killed_pid` is our child, which
+        // only the wait below reaps, so the id is still its own.
+        unsafe {
+            libc::kill(killed_pid, libc::SIGKILL);
+        }
+        let mut statuses = [None, None];
+        for (status, pid) in statuses.iter_mut().zip([killed_pid, exited_pid]) {
+            assert!(
+                wait_until(200, || {
+                    *status = unreaped_exit_status(pid);
+                    status.is_some()
+                }),
+                "{pid} never exited"
+            );
+        }
+        let unreaped = [is_our_zombie(killed_pid), is_our_zombie(exited_pid)];
+        let waited = [killed.wait().unwrap(), exited.wait().unwrap()];
+        let after = [unreaped_exit_status(killed_pid), unreaped_exit_status(exited_pid)];
+        assert_eq!(running, None, "read a status while the child ran");
+        assert_eq!(statuses[0].and_then(|s| s.signal()), Some(libc::SIGKILL));
+        assert_eq!(statuses[1].and_then(|s| s.code()), Some(3));
+        assert_eq!(unreaped, [true, true], "reading the status reaped the child");
+        assert_eq!(statuses, waited.map(Some), "the status read is not the one wait reports");
+        assert_eq!(after, [None, None], "read a status once the child was reaped");
+    }
+
+    /// The status of a child kill_tree leaves to a reaper thread is still
+    /// read, and only then is the child reaped. Its pid is held twice, by
+    /// this test and by kill_tree_and_status: `is_held` holds it while either
+    /// hold is live, and the reaper, which drops released holds first, waits
+    /// for this test's.
+    #[test]
+    fn kill_tree_status_reads_a_child_left_to_a_reaper_thread() {
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = Scratch::new("killreaper");
+        let child = spawn_sigterm_ignoring_group(&scratch);
+        let pid = child.id();
+        // Kept past kill_tree, unlike kill_tree_and_status's own hold, so the
+        // reap is left to a reaper thread.
+        let release = CHILDREN.hold_reap(pid);
+        // On another thread: a reap that blocks fails the test instead of
+        // hanging it, and the release, dropped as the test unwinds, frees it.
+        let (returned, status, _, _) = promptly(move || kill_tree_and_status(child, Instant::now()));
+        drop(release);
+        assert_eq!(returned, None, "a held child was reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(wait_until(40, || !is_our_zombie(pid as libc::pid_t)), "the reaper never reaped {pid}");
     }
 
     // --- read_rate_limits against a fake app server ---
@@ -1446,22 +1550,31 @@ mod tests {
     #[test]
     fn app_server_that_cannot_be_reaped_still_times_out_on_time() {
         let scratch = Scratch::new("rpcstuck");
-        let pidfile = scratch.path("pid");
-        let codex = scratch.script("codex", &format!("#!/bin/sh\necho $$ > {}\nsleep 30", pidfile.display()));
+        let codex = scratch.script("codex", "#!/bin/sh\nsleep 30");
         let budget = Duration::from_millis(1500);
         let (tx, rx) = std::sync::mpsc::channel();
-        let start = Instant::now();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(read_rate_limits(&CodexBin { path: codex, child_path: None }, Instant::now() + budget));
+            // The start is taken here, not before the thread runs: how late a
+            // busy machine runs it is no part of how long the probe takes.
+            let start = Instant::now();
+            // Held from its spawn on: a busy machine can pass the deadline,
+            // and kill and reap the server, before this test could read its
+            // pid.
+            let _ = hold_tx.send((hold_next_reap(), start));
+            let _ = tx.send(read_rate_limits(&CodexBin { path: codex, child_path: None }, start + budget));
         });
-        assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
-        let pid = read_pid(&pidfile);
-        let release = CHILDREN.hold_reap(pid as u32);
+        let ((release, spawned), start) =
+            hold_rx.recv_timeout(Duration::from_secs(10)).expect("the probe never started");
+        let pid = spawned.recv_timeout(Duration::from_secs(10)).expect("the probe spawned no app server");
+        assert!(pid > 1, "bad pid {pid}");
         let result = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
         let elapsed = start.elapsed();
         let recorded = CHILDREN.contains(pid as u32);
-        let unreaped = is_our_zombie(pid);
+        // Exited, however long a busy machine takes SIGKILL to end it, and
+        // still unreaped while held.
+        let unreaped = wait_until(200, || is_our_zombie(pid));
         drop(release);
         let result = result.expect("read_rate_limits never returned");
         assert_eq!(expect_err(result).code, ErrorCode::Timeout);
