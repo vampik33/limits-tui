@@ -390,6 +390,18 @@ mod tests {
         }
     }
 
+    /// sh_resolver with a program of its own, a symlink to /bin/sh in
+    /// `scratch`. For a lookup whose group gets SIGKILL with something still
+    /// running in it: on a loaded host that can take past REAP_WAIT to die,
+    /// and while it counts as stuck, CHILDREN refuses its program
+    /// (`Children::spawn`), which then must not be the /bin/sh other tests
+    /// run.
+    fn own_sh_resolver(scratch: &Scratch, script: &str, budget: Duration) -> ChildResolver {
+        let program = scratch.path("sh");
+        std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
+        ChildResolver { program, ..sh_resolver(script, budget) }
+    }
+
     fn resolve_uri(resolver: &ChildResolver, uri: &str, config: &Config) -> Result<Vec<SocketAddr>, ureq::Error> {
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
         let uri: Uri = uri.parse().unwrap();
@@ -494,7 +506,8 @@ mod tests {
     fn hung_lookup_times_out_by_the_deadline_and_leaves_nothing_running() {
         // The token marks the child's background job, which killpg must reach.
         let token = sleep_token("hung");
-        let resolver = sh_resolver(&format!("sleep 30 {token} & wait"), Duration::from_millis(500));
+        let scratch = Scratch::new("hung");
+        let resolver = own_sh_resolver(&scratch, &format!("sleep 30 {token} & wait"), Duration::from_millis(500));
         let start = Instant::now();
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
         let elapsed = start.elapsed();
@@ -510,7 +523,10 @@ mod tests {
         // The job sends its output elsewhere, so the child exits and stdout
         // closes while the job still runs in the child's group.
         let token = sleep_token("quiet");
-        let got = resolve(&format!("sleep 30 {token} >/dev/null 2>&1 &\necho 192.0.2.1:443")).unwrap();
+        let scratch = Scratch::new("quiet");
+        let script = format!("sleep 30 {token} >/dev/null 2>&1 &\necho 192.0.2.1:443");
+        let resolver = own_sh_resolver(&scratch, &script, Duration::from_secs(5));
+        let got = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap();
         assert_eq!(got, addrs(&["192.0.2.1:443"]));
         let gone = wait_until(40, || live_with(&token).is_empty());
         assert!(gone, "lookup child's job is still running: {:?}", live_with(&token));
@@ -518,7 +534,8 @@ mod tests {
 
     #[test]
     fn addresses_printed_by_a_lookup_cut_off_at_the_deadline_time_out() {
-        let resolver = sh_resolver("echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500));
+        let scratch = Scratch::new("cutoff");
+        let resolver = own_sh_resolver(&scratch, "echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500));
         let start = Instant::now();
         let result = resolve_uri(&resolver, "https://example.com/", &Config::default());
         let elapsed = start.elapsed();
@@ -573,6 +590,63 @@ mod tests {
         let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
         assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
         assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+    }
+
+    /// Issue #40: while a lookup child SIGKILL couldn't end waits for its
+    /// reap, the next lookup fails, as "update failed", without
+    /// starting another; another program still starts, and once the stuck
+    /// child is reaped, the lookup starts it again.
+    #[test]
+    fn lookup_is_not_started_again_while_an_earlier_one_is_stuck() {
+        use crate::probe::child::{CHILDREN, REAP_WAIT};
+        let scratch = Scratch::new("resolveagain");
+        // A program of its own: while it is stuck, CHILDREN refuses it, here
+        // to no other test.
+        let program = scratch.path("sh");
+        std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
+        let log = scratch.path("runs");
+        let runs = || std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        let resolver = |script: &str, budget: Duration| ChildResolver {
+            program: program.clone(),
+            args: vec!["-c".into(), format!("echo $$ >> {}; {script}", log.display()), "sh".into()],
+            deadline: Instant::now() + budget,
+            path: std::env::var_os("PATH"),
+        };
+        let budget = Duration::from_millis(1000);
+        let first = resolver("exec sleep 30", budget);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_uri(&first, "https://example.com/", &Config::default()).map_err(map_error));
+        });
+        assert!(wait_until(40, || runs() == 1));
+        let pid: libc::pid_t = std::fs::read_to_string(&log).unwrap().trim().parse().unwrap();
+        assert!(pid > 1, "bad pid {pid}");
+        let release = CHILDREN.hold_reap(pid as u32);
+        let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
+        let second = resolve_uri(
+            &resolver("echo 192.0.2.1:443", Duration::from_secs(2)),
+            "https://example.com/",
+            &Config::default(),
+        );
+        let started_while_stuck = runs();
+        let other = resolve("echo 192.0.2.2:443");
+        drop(release);
+        let first = first.expect("the lookup never returned");
+        assert_eq!(first.map_err(|e| e.code), Err(ErrorCode::Timeout));
+        assert_eq!(started_while_stuck, 1, "a second lookup child was started while the first was stuck");
+        assert_eq!(map_error(second.expect_err("the stuck lookup's program ran again")).code, ErrorCode::Failed);
+        assert_eq!(other.expect("another program was held up"), addrs(&["192.0.2.2:443"]));
+        assert!(
+            wait_until(40, || !CHILDREN.contains(pid as u32)),
+            "lookup child {pid} is still in CHILDREN once released"
+        );
+        let third = resolve_uri(
+            &resolver("echo 192.0.2.1:443", Duration::from_secs(5)),
+            "https://example.com/",
+            &Config::default(),
+        );
+        assert_eq!(third.expect("the lookup was not started again once reaped"), addrs(&["192.0.2.1:443"]));
+        assert_eq!(runs(), 2);
     }
 
     #[test]

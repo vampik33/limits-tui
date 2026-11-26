@@ -92,16 +92,30 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
     if let Some(p) = std::env::var("PATH").ok().and_then(|path| codex_on_path(&path)) {
         return Ok(CodexBin { path: p, child_path: None });
     }
-    if let Ok(shell) = std::env::var("SHELL") {
-        // The login shell may source slow config; bound it like the Python probe.
-        let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
-        if let Some(stdout) = login_shell_lookup(shell.as_ref(), std::env::var_os("PATH").as_deref(), shell_deadline)
-            && let Some(codex) = codex_from_login_output(&stdout, std::env::var_os("PATH"))
-        {
-            return Ok(codex);
-        }
+    if let Ok(shell) = std::env::var("SHELL")
+        && let Some(codex) = codex_from_login_shell(shell.as_ref(), std::env::var_os("PATH"), deadline)?
+    {
+        return Ok(codex);
     }
     Err(ProbeError::new(ErrorCode::Missing, "codex not found on PATH"))
+}
+
+/// Codex as `shell`'s login config finds it (login_shell_lookup, run with
+/// `ours`, our PATH, by `deadline` and within 5 s), or None. Fails without
+/// starting the shell while an earlier lookup's shell is stuck
+/// (`Children::spawn` refuses it): codex may be installed all the same.
+fn codex_from_login_shell(
+    shell: &std::ffi::OsStr,
+    ours: Option<std::ffi::OsString>,
+    deadline: Instant,
+) -> Result<Option<CodexBin>, ProbeError> {
+    if CHILDREN.is_stuck(shell) {
+        return Err(ProbeError::new(ErrorCode::Failed, "an earlier login shell is stuck"));
+    }
+    // The login shell may source slow config; bound it like the Python probe.
+    let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
+    Ok(login_shell_lookup(shell, ours.as_deref(), shell_deadline)
+        .and_then(|stdout| codex_from_login_output(&stdout, ours)))
 }
 
 /// Codex as named by CODEX_BIN, made absolute against our working directory:
@@ -417,11 +431,18 @@ pub fn fetch() -> ProbeResult {
 }
 
 /// Ask `codex app-server` for the account's rate limits, by `deadline`, then
-/// stop it.
+/// stop it. Fails without starting it while an earlier one is stuck
+/// (`Children::spawn` refuses it).
 fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
-    let mut child = CHILDREN
-        .spawn(&mut app_server_command(codex, std::env::var_os("PATH").as_deref()))
-        .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
+    let mut child =
+        CHILDREN.spawn(&mut app_server_command(codex, std::env::var_os("PATH").as_deref())).map_err(|e| {
+            // Refused, not missing: codex may be installed all the same.
+            if e.kind() == std::io::ErrorKind::ResourceBusy {
+                ProbeError::new(ErrorCode::Failed, "an earlier codex app-server is stuck")
+            } else {
+                ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}"))
+            }
+        })?;
 
     let result = (|| {
         let mut rpc = Rpc::spawn(&mut child, deadline)?;
@@ -1075,11 +1096,16 @@ mod tests {
     /// a quit to kill until a reaper thread reaps it.
     #[test]
     fn kill_tree_returns_when_the_leader_cannot_be_reaped() {
+        // A program of its own: while its leader is stuck, CHILDREN refuses
+        // that program, here to no other test.
+        let scratch = Scratch::new("killstuck");
+        let sh = scratch.path("sh");
+        std::os::unix::fs::symlink("/bin/sh", &sh).unwrap();
         let child = {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
             CHILDREN
                 .spawn(
-                    Command::new("/bin/sh")
+                    Command::new(&sh)
                         .args(["-c", "sleep 30"])
                         .stdin(Stdio::piped())
                         .stdout(Stdio::null())
@@ -1438,6 +1464,125 @@ mod tests {
             "app server {pid} is still in CHILDREN once released"
         );
         assert!(wait_until(40, || !is_our_zombie(pid)), "the reaper never reaped app server {pid}");
+    }
+
+    /// Lines in `path`, a file test scripts append their pid to.
+    fn runs(path: &std::path::Path) -> Vec<libc::pid_t> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.split_terminator('\n').map(|pid| pid.trim().parse().unwrap()).collect()
+    }
+
+    /// Issue #40: while an app server SIGKILL couldn't end waits for its
+    /// reap, the probe fails at once, as "update failed", without starting
+    /// another; another codex still starts, and once the stuck one is reaped,
+    /// the next probe starts it again.
+    #[test]
+    fn app_server_is_not_started_again_while_an_earlier_one_is_stuck() {
+        assert_app_server_not_started_again_while_stuck("rpcagain", |pid| CHILDREN.hold_reap(pid));
+    }
+
+    /// The same when the server exits but a process it started can't be ended
+    /// (the npm shim's node exits, the native codex under it is stuck).
+    #[test]
+    fn app_server_is_not_started_again_while_a_process_it_started_is_stuck() {
+        assert_app_server_not_started_again_while_stuck("rpcmember", |group| CHILDREN.hold_group(group));
+    }
+
+    /// An app server that starts a process (as the npm shim does), with `hold`
+    /// making it stuck once SIGKILL reaches it; the probes as the tests above
+    /// describe. Scratch dirs are named after `test`.
+    fn assert_app_server_not_started_again_while_stuck(test: &str, hold: impl Fn(u32) -> std::sync::mpsc::Sender<()>) {
+        let scratch = Scratch::new(test);
+        let log = scratch.path("runs");
+        let codex = scratch.script("codex", &format!("#!/bin/sh\necho $$ >> {}\nsleep 30", log.display()));
+        let other_log = scratch.path("other-runs");
+        let other = scratch.script("other/codex", &format!("#!/bin/sh\necho $$ >> {}\nsleep 30", other_log.display()));
+        let probe = |path: &std::path::PathBuf, budget: Duration| {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let start = Instant::now();
+            let result = read_rate_limits(&CodexBin { path: path.clone(), child_path: None }, start + budget);
+            (result, start.elapsed())
+        };
+        let budget = Duration::from_millis(1000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first_codex = codex.clone();
+        std::thread::spawn(move || {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now() + budget;
+            let _ = tx.send(read_rate_limits(&CodexBin { path: first_codex, child_path: None }, deadline));
+        });
+        assert!(wait_until(40, || runs(&log).len() == 1));
+        let pid = runs(&log)[0];
+        assert!(pid > 1, "bad pid {pid}");
+        let release = hold(pid as u32);
+        let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
+        let (second, second_took) = probe(&codex, Duration::from_secs(2));
+        let started_while_stuck = runs(&log).len();
+        let (other_result, _) = probe(&other, Duration::from_millis(300));
+        drop(release);
+        assert_eq!(expect_err(first.expect("read_rate_limits never returned")).code, ErrorCode::Timeout);
+        assert_eq!(started_while_stuck, 1, "a second app server was started while the first was stuck");
+        let second = expect_err(second);
+        assert_eq!((second.code, second.detail.as_str()), (ErrorCode::Failed, "an earlier codex app-server is stuck"));
+        assert!(second_took < Duration::from_millis(500), "the refusal took {second_took:?}");
+        assert_eq!(expect_err(other_result).code, ErrorCode::Timeout);
+        assert_eq!(runs(&other_log).len(), 1, "another codex was not started");
+        assert!(
+            wait_until(40, || !CHILDREN.contains(pid as u32)),
+            "app server {pid} is still in CHILDREN once released"
+        );
+        let (third, _) = probe(&codex, Duration::from_millis(300));
+        assert_eq!(expect_err(third).code, ErrorCode::Timeout);
+        assert_eq!(runs(&log).len(), 2, "the app server was not started again once reaped");
+    }
+
+    /// The same for the login-shell lookup: while its shell is stuck, the
+    /// probe fails (codex may be installed all the same) instead of reporting
+    /// codex missing, without starting the shell again.
+    #[test]
+    fn login_shell_is_not_started_again_while_an_earlier_one_is_stuck() {
+        let scratch = Scratch::new("shellagain");
+        let log = scratch.path("runs");
+        let shell = scratch.shell(&format!("echo $$ >> {}; exec sleep 30", log.display()));
+        let found = scratch.script("bin/codex", "#!/bin/sh\n");
+        let other = scratch.script(
+            "other/shell",
+            &format!("#!/bin/sh\nprintf '%s\\n' '{LOGIN_MARKER}' /usr/bin:/bin {}\n", found.display()),
+        );
+        let lookup = |shell: &std::path::PathBuf, budget: Duration| {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let start = Instant::now();
+            let result = codex_from_login_shell(shell.as_os_str(), Some("/usr/bin:/bin".into()), start + budget);
+            (result, start.elapsed())
+        };
+        let budget = Duration::from_millis(1000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first_shell = shell.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lookup(&first_shell, budget).0);
+        });
+        assert!(wait_until(40, || runs(&log).len() == 1));
+        let pid = runs(&log)[0];
+        assert!(pid > 1, "bad pid {pid}");
+        let release = CHILDREN.hold_reap(pid as u32);
+        let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
+        let (second, second_took) = lookup(&shell, Duration::from_secs(2));
+        let started_while_stuck = runs(&log).len();
+        let (other_result, _) = lookup(&other, Duration::from_secs(5));
+        drop(release);
+        let first = first.expect("the lookup never returned");
+        assert!(matches!(first, Ok(None)), "no marker, no codex: {:?}", first.map(|c| c.map(|c| c.path)));
+        assert_eq!(started_while_stuck, 1, "a second shell was started while the first was stuck");
+        let second = second.map(|c| c.map(|c| c.path)).expect_err("the stuck shell's lookup did not fail");
+        assert_eq!((second.code, second.detail.as_str()), (ErrorCode::Failed, "an earlier login shell is stuck"));
+        assert!(second_took < Duration::from_millis(500), "the refusal took {second_took:?}");
+        let other_codex = other_result.expect("another shell was held up").expect("another shell found no codex");
+        assert_eq!(other_codex.path, found);
+        assert_eq!(other_codex.child_path.as_deref(), Some("/usr/bin:/bin".as_ref()));
+        assert!(wait_until(40, || !CHILDREN.contains(pid as u32)), "shell {pid} is still in CHILDREN once released");
+        let (third, _) = lookup(&shell, Duration::from_millis(300));
+        assert!(matches!(third, Ok(None)), "{:?}", third.map(|c| c.map(|c| c.path)));
+        assert_eq!(runs(&log).len(), 2, "the shell was not started again once reaped");
     }
 
     #[test]
