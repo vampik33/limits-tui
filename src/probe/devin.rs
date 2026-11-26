@@ -575,6 +575,63 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
     }
 
+    /// Issue #40: while a lookup child SIGKILL couldn't end waits for its
+    /// reap, the next lookup fails, as "update failed", without
+    /// starting another; another program still starts, and once the stuck
+    /// child is reaped, the lookup starts it again.
+    #[test]
+    fn lookup_is_not_started_again_while_an_earlier_one_is_stuck() {
+        use crate::probe::child::{CHILDREN, REAP_WAIT};
+        let scratch = Scratch::new("resolveagain");
+        // A program of its own: while it is stuck, CHILDREN refuses it, here
+        // to no other test.
+        let program = scratch.path("sh");
+        std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
+        let log = scratch.path("runs");
+        let runs = || std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        let resolver = |script: &str, budget: Duration| ChildResolver {
+            program: program.clone(),
+            args: vec!["-c".into(), format!("echo $$ >> {}; {script}", log.display()), "sh".into()],
+            deadline: Instant::now() + budget,
+            path: std::env::var_os("PATH"),
+        };
+        let budget = Duration::from_millis(1000);
+        let first = resolver("exec sleep 30", budget);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_uri(&first, "https://example.com/", &Config::default()).map_err(map_error));
+        });
+        assert!(wait_until(40, || runs() == 1));
+        let pid: libc::pid_t = std::fs::read_to_string(&log).unwrap().trim().parse().unwrap();
+        assert!(pid > 1, "bad pid {pid}");
+        let release = CHILDREN.hold_reap(pid as u32);
+        let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
+        let second = resolve_uri(
+            &resolver("echo 192.0.2.1:443", Duration::from_secs(2)),
+            "https://example.com/",
+            &Config::default(),
+        );
+        let started_while_stuck = runs();
+        let other = resolve("echo 192.0.2.2:443");
+        drop(release);
+        let first = first.expect("the lookup never returned");
+        assert_eq!(first.map_err(|e| e.code), Err(ErrorCode::Timeout));
+        assert_eq!(started_while_stuck, 1, "a second lookup child was started while the first was stuck");
+        assert_eq!(map_error(second.expect_err("the stuck lookup's program ran again")).code, ErrorCode::Failed);
+        assert_eq!(other.expect("another program was held up"), addrs(&["192.0.2.2:443"]));
+        assert!(
+            wait_until(40, || !CHILDREN.contains(pid as u32)),
+            "lookup child {pid} is still in CHILDREN once released"
+        );
+        let third = resolve_uri(
+            &resolver("echo 192.0.2.1:443", Duration::from_secs(5)),
+            "https://example.com/",
+            &Config::default(),
+        );
+        assert_eq!(third.expect("the lookup was not started again once reaped"), addrs(&["192.0.2.1:443"]));
+        assert_eq!(runs(), 2);
+    }
+
     #[test]
     fn probe_requests_go_through_the_child_resolver() {
         // Only the fake child knows where this name is: ureq's own resolver

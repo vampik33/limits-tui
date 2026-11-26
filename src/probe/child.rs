@@ -4,6 +4,7 @@
 //! recorded in CHILDREN while it lives, so quitting the TUI, which doesn't wait
 //! for the detached probe threads, kills them too.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -149,7 +150,10 @@ impl BoundedOutput {
 /// a reaper thread (`reap_killed`). The lock is never held across a spawn
 /// (fork and exec, which can stall on a hung mount) or a wait on a child or its
 /// output, so one probe's spawn never waits for another's, and `kill_all`
-/// waits at most SPAWN_WAIT, for spawns in flight.
+/// waits at most SPAWN_WAIT, for spawns in flight. While a leader SIGKILL
+/// couldn't end waits in a reaper thread, no child of its program is spawned
+/// (`spawn`), so retries against a cause that persists (a hung mount) don't
+/// add one stuck child each.
 pub(super) struct Children {
     groups: Mutex<Groups>,
     /// Signalled at the end of each spawn, for `kill_all` to stop waiting.
@@ -164,16 +168,37 @@ struct Groups {
     /// Group ids: the pids of children spawned with `process_group(0)` and not
     /// reaped yet.
     live: Vec<libc::pid_t>,
+    /// The leader of each group in `live`.
+    leaders: Vec<Leader>,
     /// Set by `kill_all`: no child is spawned after it.
     closed: bool,
     /// Spawns in flight: started, but their child not recorded yet.
     spawning: usize,
 }
 
+impl Groups {
+    /// Whether a leader running `program` was left to a reaper thread and
+    /// is not reaped yet.
+    fn is_stuck(&self, program: &OsStr) -> bool {
+        self.leaders.iter().any(|leader| leader.stuck && leader.program == program)
+    }
+}
+
+/// A recorded group's leader.
+struct Leader {
+    group: libc::pid_t,
+    /// What it was spawned to run (`Command::get_program`): each probe's
+    /// children run their own (the codex app server, the login shell, this
+    /// binary for Devin's lookup).
+    program: OsString,
+    /// `reap_killed` left it to a reaper thread: SIGKILL hasn't ended it.
+    stuck: bool,
+}
+
 impl Children {
     const fn new() -> Self {
         Self {
-            groups: Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }),
+            groups: Mutex::new(Groups { live: Vec::new(), leaders: Vec::new(), closed: false, spawning: 0 }),
             spawn_done: Condvar::new(),
             #[cfg(test)]
             held: Mutex::new(Vec::new()),
@@ -187,12 +212,18 @@ impl Children {
     /// killed by it, killed by its own spawn, or never spawned. Only a spawn
     /// still stalled in exec when `kill_all` stops waiting (SPAWN_WAIT) and the
     /// process exits can leave a child that outlives the quit. A killed child is
-    /// still returned, for the caller to reap through `reap`.
+    /// still returned, for the caller to reap through `reap`. Fails without
+    /// spawning while an earlier child of the same program is stuck
+    /// (`is_stuck`): whatever kept SIGKILL from ending it would most likely
+    /// catch this one too.
     pub(super) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
         {
             let mut groups = self.lock();
             if groups.closed {
                 return Err(std::io::Error::other("quitting: no new child"));
+            }
+            if groups.is_stuck(cmd.get_program()) {
+                return Err(std::io::Error::other("an earlier child of this program is stuck"));
             }
             groups.spawning += 1;
         }
@@ -203,6 +234,7 @@ impl Children {
         let child = spawned?;
         let group = child.id() as libc::pid_t;
         groups.live.push(group);
+        groups.leaders.push(Leader { group, program: cmd.get_program().to_owned(), stuck: false });
         if groups.closed {
             // SAFETY: killpg only sends a signal. `group` is the pid of the
             // child just spawned, which leads the group process_group(0)
@@ -220,7 +252,11 @@ impl Children {
     /// pid may have been reused.
     pub(super) fn reap(&self, child: &mut Child) -> std::io::Result<ExitStatus> {
         let pid = child.id() as libc::pid_t;
-        self.lock().live.retain(|&group| group != pid);
+        {
+            let mut groups = self.lock();
+            groups.live.retain(|&group| group != pid);
+            groups.leaders.retain(|leader| leader.group != pid);
+        }
         child.wait()
     }
 
@@ -231,8 +267,10 @@ impl Children {
     /// for its exit without a bound and reaps it through `reap`, and None is
     /// returned. Its group stays recorded until then, so `kill_all` still
     /// signals it, and its pid, held by the unreaped leader, can't be reused
-    /// while recorded. If the thread can't be started, the leader is never
-    /// reaped and its group stays recorded: it holds its pid until we exit.
+    /// while recorded. Until then the leader counts as stuck, and `spawn`
+    /// refuses its program. If the thread can't be started, the leader is never
+    /// reaped and its group stays recorded: it holds its pid, and its program
+    /// stays refused, until we exit.
     pub(super) fn reap_killed(&'static self, mut child: Child) -> Option<ExitStatus> {
         let end = Instant::now() + REAP_WAIT;
         // Failing to check on it counts as exited: `wait` then fails at once
@@ -240,6 +278,12 @@ impl Children {
         while !(has_exited(&child).unwrap_or(true) && !self.is_held(&child)) {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                // Marked before the reaper starts: once it reaps the leader,
+                // its pid may be reused by a child this would mark instead.
+                let group = child.id() as libc::pid_t;
+                if let Some(leader) = self.lock().leaders.iter_mut().find(|leader| leader.group == group) {
+                    leader.stuck = true;
+                }
                 let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
                     #[cfg(test)]
                     self.wait_until_released(&child);
@@ -282,8 +326,15 @@ impl Children {
         }
     }
 
-    /// The lock, even if a thread panicked holding it: `live`, `closed` and
-    /// `spawning` are each changed in one step, and quitting must still kill.
+    /// Whether a child of `program` was left to a reaper thread, SIGKILL not
+    /// having ended it, and is not reaped yet: `spawn` refuses `program`.
+    pub(super) fn is_stuck(&self, program: &OsStr) -> bool {
+        self.lock().is_stuck(program)
+    }
+
+    /// The lock, even if a thread panicked holding it: `live`, `leaders`,
+    /// `closed` and `spawning` are each changed in one step (`live` and
+    /// `leaders` together), and quitting must still kill.
     fn lock(&self) -> MutexGuard<'_, Groups> {
         self.groups.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -829,5 +880,164 @@ mod tests {
         assert!(recorded, "run_bounded's child {pid} is not in CHILDREN");
         rx.recv_timeout(Duration::from_secs(10)).expect("the bounded run never returned");
         assert!(!CHILDREN.contains(pid));
+    }
+
+    /// A child of `cmd` recorded in `children` and left stuck: sent SIGKILL
+    /// with its reap held, as if in uninterruptible sleep, so reap_killed
+    /// leaves it to a reaper thread. Returns its group and the hold.
+    fn stuck_child(children: &'static Children, cmd: &mut Command) -> (libc::pid_t, mpsc::Sender<()>) {
+        cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).process_group(0);
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            children.spawn(cmd).expect("cannot spawn")
+        };
+        let group = child.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        let release = children.hold_reap(child.id());
+        // SAFETY: killpg only sends a signal. `group` leads the group
+        // process_group(0) created, and nothing reaps it before reap_killed.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        // On another thread: a reap that blocks fails the test instead of
+        // hanging it, and the release, dropped as the test unwinds, frees it.
+        let status = promptly(move || children.reap_killed(child));
+        assert_eq!(status, None, "a held child was reaped");
+        (group, release)
+    }
+
+    /// `cmd` run bounded (5 s) and recorded in `children`.
+    fn run_briefly(children: &'static Children, cmd: &mut Command) -> Option<Vec<u8>> {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        run_bounded_with(children, cmd, Instant::now() + Duration::from_secs(5))
+    }
+
+    /// Issue #40: while a child SIGKILL couldn't end waits in a reaper thread,
+    /// its program isn't started again, so retries can't pile up stuck
+    /// children; another program still starts, and once the stuck child is
+    /// reaped, its program starts again.
+    #[test]
+    fn a_program_is_not_spawned_again_while_its_earlier_child_is_stuck() {
+        static CHILDREN: Children = Children::new();
+        let budget = Duration::from_millis(500);
+        let (group, release, done, _) = run_held(&CHILDREN, "exec sleep 30", budget);
+        let first =
+            done.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3)).expect("the bounded run never returned");
+        let (refused, elapsed) = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let start = Instant::now();
+            (run_bounded_with(&CHILDREN, &mut sh("echo ran"), start + Duration::from_secs(5)), start.elapsed())
+        };
+        let (live, spawning) = {
+            let groups = CHILDREN.lock();
+            (groups.live.clone(), groups.spawning)
+        };
+        let other = run_briefly(&CHILDREN, Command::new("echo").arg("other"));
+        drop(release);
+        assert_eq!(first, Some(Vec::new()));
+        assert_eq!(refused, None, "a second /bin/sh child was spawned while the first was stuck");
+        assert!(elapsed < Duration::from_millis(500), "the refusal took {elapsed:?}");
+        assert_eq!(live, [group], "the refused spawn changed what is recorded");
+        assert_eq!(spawning, 0, "the refused spawn is still counted in flight");
+        assert_eq!(other.as_deref(), Some(&b"other\n"[..]), "another program was held up");
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once released");
+        assert_eq!(run_briefly(&CHILDREN, &mut sh("echo ran")).as_deref(), Some(&b"ran\n"[..]));
+        assert!(CHILDREN.lock().live.is_empty());
+    }
+
+    /// A stuck child counts as stuck exactly while its group is recorded.
+    #[test]
+    fn a_child_left_to_the_reaper_is_stuck_until_it_is_reaped() {
+        static CHILDREN: Children = Children::new();
+        let sh_program = OsStr::new("/bin/sh");
+        assert!(!CHILDREN.is_stuck(sh_program));
+        let (group, release) = stuck_child(&CHILDREN, &mut sh("exec sleep 30"));
+        let stuck = CHILDREN.is_stuck(sh_program);
+        let recorded = CHILDREN.contains(group as u32);
+        let unreaped = is_our_zombie(group);
+        drop(release);
+        assert!(stuck, "a child left to the reaper is not stuck");
+        assert!(recorded, "group {group} was forgotten before its leader was reaped");
+        assert!(unreaped, "leader {group} was reaped while held, or never killed");
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once released");
+        assert!(!CHILDREN.is_stuck(sh_program), "still stuck once reaped");
+        assert!(CHILDREN.lock().leaders.is_empty());
+    }
+
+    /// Each stuck program is refused and freed on its own.
+    #[test]
+    fn stuck_programs_are_refused_and_freed_each_on_its_own() {
+        static CHILDREN: Children = Children::new();
+        let sleep_program = OsStr::new("sleep");
+        let sh_program = OsStr::new("/bin/sh");
+        let (sh_group, sh_release) = stuck_child(&CHILDREN, &mut sh("exec sleep 30"));
+        let (sleep_group, sleep_release) = stuck_child(&CHILDREN, Command::new("sleep").arg("30"));
+        assert!(CHILDREN.is_stuck(sh_program) && CHILDREN.is_stuck(sleep_program));
+        assert_eq!(run_briefly(&CHILDREN, Command::new("sleep").arg("0")), None);
+        drop(sleep_release);
+        assert!(
+            wait_until(40, || !CHILDREN.contains(sleep_group as u32)),
+            "group {sleep_group} is still recorded once released"
+        );
+        assert!(!CHILDREN.is_stuck(sleep_program), "sleep is still stuck once reaped");
+        assert!(CHILDREN.is_stuck(sh_program), "freeing sleep freed /bin/sh too");
+        assert_eq!(run_briefly(&CHILDREN, Command::new("sleep").arg("0")), Some(Vec::new()));
+        assert_eq!(run_briefly(&CHILDREN, &mut sh("echo ran")), None);
+        drop(sh_release);
+        assert!(
+            wait_until(40, || !CHILDREN.contains(sh_group as u32)),
+            "group {sh_group} is still recorded once released"
+        );
+        assert!(!CHILDREN.is_stuck(sh_program));
+        assert_eq!(run_briefly(&CHILDREN, &mut sh("echo ran")).as_deref(), Some(&b"ran\n"[..]));
+    }
+
+    /// Only a child left to the reaper is stuck: one that ends by itself or
+    /// on the SIGKILL at its deadline leaves its program free.
+    #[test]
+    fn a_child_reaped_before_its_run_returns_leaves_its_program_free() {
+        static CHILDREN: Children = Children::new();
+        for (script, budget) in [("echo $$", Duration::from_secs(5)), ("exec sleep 30", Duration::from_millis(300))] {
+            let out = {
+                let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+                run_bounded_with(&CHILDREN, &mut sh(script), Instant::now() + budget)
+            };
+            assert!(out.is_some(), "{script:?}: not started");
+            assert!(!CHILDREN.is_stuck(OsStr::new("/bin/sh")), "{script:?}: left /bin/sh stuck");
+            assert!(CHILDREN.lock().leaders.is_empty(), "{script:?}: its leader is still recorded");
+            assert_eq!(run_briefly(&CHILDREN, &mut sh("echo ran")).as_deref(), Some(&b"ran\n"[..]), "{script:?}");
+        }
+    }
+
+    /// A child spawned outside `children` (kill_tree's callers may pass one)
+    /// marks no program stuck when its reap is left to a reaper thread.
+    #[test]
+    fn reap_killed_marks_no_program_for_a_child_it_did_not_record() {
+        static CHILDREN: Children = Children::new();
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            sh("exec sleep 30")
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("cannot spawn")
+        };
+        let group = child.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        let release = CHILDREN.hold_reap(child.id());
+        // SAFETY: as in stuck_child.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        let status = promptly(move || CHILDREN.reap_killed(child));
+        let stuck = CHILDREN.is_stuck(OsStr::new("/bin/sh"));
+        let ran = run_briefly(&CHILDREN, &mut sh("echo ran"));
+        drop(release);
+        assert_eq!(status, None, "a held child was reaped");
+        assert!(!stuck, "an unrecorded child marked /bin/sh stuck");
+        assert_eq!(ran.as_deref(), Some(&b"ran\n"[..]));
+        assert!(wait_until(40, || !is_our_zombie(group)), "the reaper never reaped {group}");
     }
 }
