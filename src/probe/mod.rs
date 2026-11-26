@@ -746,31 +746,57 @@ mod tests {
         }
     }
 
+    /// CPU time this thread has used so far: unlike the wall clock, it
+    /// doesn't run on while a loaded host runs other threads instead.
+    fn thread_cpu_time() -> Duration {
+        // SAFETY: an all-zero timespec is a valid value for clock_gettime to
+        // fill in.
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: `now` is a valid, writable timespec.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+        assert_eq!(rc, 0, "no CPU clock for this thread");
+        Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
     /// Exponents far past any int stay cheap: no allocation or loop grows
     /// with the exponent's value, and saturating it keeps the outcome exact.
+    /// Cheap is judged by the CPU time json_int takes, which a loaded host
+    /// doesn't stretch as it does the wall clock: about 0.2 s in a debug
+    /// build, where a loop or a string as long as one of these exponents takes
+    /// seconds. The tokens are built and parsed before that clock starts:
+    /// serde_json's work grows with their length, json_int's is what is
+    /// judged.
     #[test]
     fn json_int_handles_huge_exponents_promptly() {
-        let got = promptly(|| {
-            let huge = "9".repeat(1_000_000);
-            let zeros = "0".repeat(1_000_000);
-            [
-                "1e999999999".to_string(),
-                "-1e999999999".to_string(),
-                "1e-999999999".to_string(),
-                "0e999999999".to_string(),
-                "1e99999999999999999999999999999".to_string(),
-                "1e-99999999999999999999999999999".to_string(),
-                "0.0e-99999999999999999999999999999".to_string(),
-                format!("1e{huge}"),
-                format!("1e-{huge}"),
-                // A million trailing zeros and an exponent that takes them back.
-                format!("1{zeros}e-1000000"),
-                format!("-0.{zeros}5e1000001"),
-                format!("1{zeros}e-999980"),
-            ]
-            .map(|text| json_int(&serde_json::from_str(&text).unwrap()))
+        let huge = "9".repeat(1_000_000);
+        let zeros = "0".repeat(1_000_000);
+        let values = [
+            "1e999999999".to_string(),
+            "-1e999999999".to_string(),
+            "1e-999999999".to_string(),
+            "0e999999999".to_string(),
+            "1e99999999999999999999999999999".to_string(),
+            "1e-99999999999999999999999999999".to_string(),
+            "0.0e-99999999999999999999999999999".to_string(),
+            format!("1e{huge}"),
+            format!("1e-{huge}"),
+            // A million trailing zeros and an exponent that takes them back.
+            format!("1{zeros}e-1000000"),
+            format!("-0.{zeros}5e1000001"),
+            format!("1{zeros}e-999980"),
+        ]
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = thread_cpu_time();
+            let got = values.each_ref().map(json_int);
+            let _ = tx.send((got, thread_cpu_time() - start));
         });
+        // Only so that a loop that never ends fails the test instead of
+        // hanging it: the CPU time is what is judged.
+        let (got, cpu) = rx.recv_timeout(Duration::from_secs(60)).expect("json_int never returned");
         assert_eq!(got, [None, None, None, Some(0), None, None, Some(0), None, None, Some(1), Some(-5), None]);
+        assert!(cpu < Duration::from_secs(2), "took {cpu:?} of CPU time");
     }
 
     /// What the JSON number `token` denotes, worked out on digit strings by

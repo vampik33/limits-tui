@@ -404,6 +404,16 @@ mod tests {
 
     fn resolve_uri(resolver: &ChildResolver, uri: &str, config: &Config) -> Result<Vec<SocketAddr>, ureq::Error> {
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        resolve_holding_scripts(resolver, uri, config)
+    }
+
+    /// `resolve_uri` for a caller that holds SCRIPTS already: taking it again
+    /// could wait for good behind a writer queued meanwhile.
+    fn resolve_holding_scripts(
+        resolver: &ChildResolver,
+        uri: &str,
+        config: &Config,
+    ) -> Result<Vec<SocketAddr>, ureq::Error> {
         let uri: Uri = uri.parse().unwrap();
         // ureq's "no timeout": the resolver must fall back to its own deadline.
         let timeout =
@@ -412,7 +422,19 @@ mod tests {
     }
 
     fn resolve(script: &str) -> Result<Vec<SocketAddr>, ureq::Error> {
-        resolve_uri(&sh_resolver(script, Duration::from_secs(5)), "https://example.com/", &Config::default())
+        resolve_timed(|| sh_resolver(script, Duration::from_secs(5))).0
+    }
+
+    /// The lookup of example.com through the resolver `make` builds, and how
+    /// long it took. SCRIPTS is taken first: the resolver, and with it its
+    /// deadline, is built and the clock started only then, as a wait for the
+    /// lock (behind a script being written) is no part of the lookup.
+    fn resolve_timed(make: impl FnOnce() -> ChildResolver) -> (Result<Vec<SocketAddr>, ureq::Error>, Duration) {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let resolver = make();
+        let start = Instant::now();
+        let result = resolve_holding_scripts(&resolver, "https://example.com/", &Config::default());
+        (result, start.elapsed())
     }
 
     fn addrs(list: &[&str]) -> Vec<SocketAddr> {
@@ -507,10 +529,10 @@ mod tests {
         // The token marks the child's background job, which killpg must reach.
         let token = sleep_token("hung");
         let scratch = Scratch::new("hung");
-        let resolver = own_sh_resolver(&scratch, &format!("sleep 30 {token} & wait"), Duration::from_millis(500));
-        let start = Instant::now();
-        let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
-        let elapsed = start.elapsed();
+        let (result, elapsed) = resolve_timed(|| {
+            own_sh_resolver(&scratch, &format!("sleep 30 {token} & wait"), Duration::from_millis(500))
+        });
+        let err = result.unwrap_err();
         assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
         assert_eq!(map_error(err).code, ErrorCode::Timeout);
         assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
@@ -535,10 +557,9 @@ mod tests {
     #[test]
     fn addresses_printed_by_a_lookup_cut_off_at_the_deadline_time_out() {
         let scratch = Scratch::new("cutoff");
-        let resolver = own_sh_resolver(&scratch, "echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500));
-        let start = Instant::now();
-        let result = resolve_uri(&resolver, "https://example.com/", &Config::default());
-        let elapsed = start.elapsed();
+        let (result, elapsed) = resolve_timed(|| {
+            own_sh_resolver(&scratch, "echo 127.0.0.1:443; exec sleep 30", Duration::from_millis(500))
+        });
         assert!(matches!(result, Err(ureq::Error::Timeout(_))), "{result:?}");
         assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     }
@@ -585,11 +606,10 @@ mod tests {
 
     #[test]
     fn deadline_already_passed_times_out_at_once() {
-        let resolver = sh_resolver("sleep 30", Duration::ZERO);
-        let start = Instant::now();
-        let err = resolve_uri(&resolver, "https://example.com/", &Config::default()).unwrap_err();
+        let (result, elapsed) = resolve_timed(|| sh_resolver("sleep 30", Duration::ZERO));
+        let err = result.unwrap_err();
         assert!(matches!(err, ureq::Error::Timeout(_)), "{err}");
-        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
     }
 
     /// Issue #40: while a lookup child SIGKILL couldn't end waits for its
@@ -598,14 +618,20 @@ mod tests {
     /// child is reaped, the lookup starts it again.
     #[test]
     fn lookup_is_not_started_again_while_an_earlier_one_is_stuck() {
-        use crate::probe::child::{CHILDREN, REAP_WAIT};
+        use crate::probe::child::{CHILDREN, REAP_WAIT, hold_next_reap};
         let scratch = Scratch::new("resolveagain");
         // A program of its own: while it is stuck, CHILDREN refuses it, here
         // to no other test.
         let program = scratch.path("sh");
         std::os::unix::fs::symlink("/bin/sh", &program).unwrap();
         let log = scratch.path("runs");
-        let runs = || std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        // The pids the lookup children other than `first` logged as they ran.
+        // The first one's line is not counted: SIGKILL at its deadline can
+        // come before a loaded host has run it.
+        let runs_besides = |first: libc::pid_t| {
+            let log = std::fs::read_to_string(&log).unwrap_or_default();
+            log.lines().filter(|pid| *pid != first.to_string()).count()
+        };
         let resolver = |script: &str, budget: Duration| ChildResolver {
             program: program.clone(),
             args: vec!["-c".into(), format!("echo $$ >> {}; {script}", log.display()), "sh".into()],
@@ -615,38 +641,36 @@ mod tests {
         let budget = Duration::from_millis(1000);
         let first = resolver("exec sleep 30", budget);
         let (tx, rx) = mpsc::channel();
+        let (hold_tx, hold_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(resolve_uri(&first, "https://example.com/", &Config::default()).map_err(map_error));
+            // Held from its spawn: a loaded host can pass the deadline, and
+            // kill and reap the child, before this test could read its pid.
+            let _ = hold_tx.send(hold_next_reap());
+            // Its deadline set once SCRIPTS is held: a wait for the lock
+            // must not use it up before the child is spawned.
+            let (first, _) = resolve_timed(|| ChildResolver { deadline: Instant::now() + budget, ..first });
+            let _ = tx.send(first.map_err(map_error));
         });
-        assert!(wait_until(40, || runs() == 1));
-        let pid: libc::pid_t = std::fs::read_to_string(&log).unwrap().trim().parse().unwrap();
+        let (release, spawned) = hold_rx.recv_timeout(Duration::from_secs(10)).expect("the lookup never started");
+        let pid = spawned.recv_timeout(Duration::from_secs(10)).expect("the lookup spawned no child");
         assert!(pid > 1, "bad pid {pid}");
-        let release = CHILDREN.hold_reap(pid as u32);
         let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
-        let second = resolve_uri(
-            &resolver("echo 192.0.2.1:443", Duration::from_secs(2)),
-            "https://example.com/",
-            &Config::default(),
-        );
-        let started_while_stuck = runs();
+        let (second, _) = resolve_timed(|| resolver("echo 192.0.2.1:443", Duration::from_secs(2)));
+        let started_while_stuck = runs_besides(pid);
         let other = resolve("echo 192.0.2.2:443");
         drop(release);
         let first = first.expect("the lookup never returned");
         assert_eq!(first.map_err(|e| e.code), Err(ErrorCode::Timeout));
-        assert_eq!(started_while_stuck, 1, "a second lookup child was started while the first was stuck");
+        assert_eq!(started_while_stuck, 0, "a second lookup child was started while the first was stuck");
         assert_eq!(map_error(second.expect_err("the stuck lookup's program ran again")).code, ErrorCode::Failed);
         assert_eq!(other.expect("another program was held up"), addrs(&["192.0.2.2:443"]));
         assert!(
             wait_until(40, || !CHILDREN.contains(pid as u32)),
             "lookup child {pid} is still in CHILDREN once released"
         );
-        let third = resolve_uri(
-            &resolver("echo 192.0.2.1:443", Duration::from_secs(5)),
-            "https://example.com/",
-            &Config::default(),
-        );
+        let (third, _) = resolve_timed(|| resolver("echo 192.0.2.1:443", Duration::from_secs(5)));
         assert_eq!(third.expect("the lookup was not started again once reaped"), addrs(&["192.0.2.1:443"]));
-        assert_eq!(runs(), 2);
+        assert_eq!(runs_besides(pid), 1);
     }
 
     #[test]

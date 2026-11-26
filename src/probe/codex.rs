@@ -1524,8 +1524,11 @@ mod tests {
         assert!(wait_until(40, || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n'))));
         let pid = read_pid(&pidfile);
         // Checked before the kill, asserted after: a failed check must not
-        // leave read_rate_limits holding SCRIPTS for its 30 s.
-        let recorded = CHILDREN.contains(pid as u32);
+        // leave read_rate_limits holding SCRIPTS for its 30 s. Waited for: the
+        // server can write its pid before `spawn`, which records it once
+        // exec has returned, gets to run again on a loaded host. It runs
+        // until the kill below, so it is recorded while it runs.
+        let recorded = wait_until(200, || CHILDREN.contains(pid as u32));
         assert!(pid > 1, "bad pid {pid}");
         // End the app server, as a quit would.
         // SAFETY: killpg only sends a signal. `pid` (the shell, `$$`) leads
@@ -1594,26 +1597,42 @@ mod tests {
         text.split_terminator('\n').map(|pid| pid.trim().parse().unwrap()).collect()
     }
 
+    /// How many runs `path` logs besides that of `first`, which SIGKILL at
+    /// its deadline can cut off before a loaded host has run it.
+    fn runs_besides(path: &std::path::Path, first: libc::pid_t) -> usize {
+        runs(path).into_iter().filter(|&pid| pid != first).count()
+    }
+
     /// Issue #40: while an app server SIGKILL couldn't end waits for its
     /// reap, the probe fails at once, as "update failed", without starting
     /// another; another codex still starts, and once the stuck one is reaped,
     /// the next probe starts it again.
     #[test]
     fn app_server_is_not_started_again_while_an_earlier_one_is_stuck() {
-        assert_app_server_not_started_again_while_stuck("rpcagain", |pid| CHILDREN.hold_reap(pid));
+        assert_app_server_not_started_again_while_stuck("rpcagain", |_, reap| reap);
     }
 
     /// The same when the server exits but a process it started can't be ended
     /// (the npm shim's node exits, the native codex under it is stuck).
     #[test]
     fn app_server_is_not_started_again_while_a_process_it_started_is_stuck() {
-        assert_app_server_not_started_again_while_stuck("rpcmember", |group| CHILDREN.hold_group(group));
+        assert_app_server_not_started_again_while_stuck("rpcmember", |group, reap| {
+            // Its group held instead; the reap, held until then, can go.
+            let hold = CHILDREN.hold_group(group);
+            drop(reap);
+            hold
+        });
     }
 
     /// An app server that starts a process (as the npm shim does), with `hold`
     /// making it stuck once SIGKILL reaches it; the probes as the tests above
-    /// describe. Scratch dirs are named after `test`.
-    fn assert_app_server_not_started_again_while_stuck(test: &str, hold: impl Fn(u32) -> std::sync::mpsc::Sender<()>) {
+    /// describe. `hold` gets the server's pid and the hold on its reap,
+    /// placed from its spawn on, and returns the hold to keep. Scratch dirs
+    /// are named after `test`.
+    fn assert_app_server_not_started_again_while_stuck(
+        test: &str,
+        hold: impl Fn(u32, std::sync::mpsc::Sender<()>) -> std::sync::mpsc::Sender<()>,
+    ) {
         let scratch = Scratch::new(test);
         let log = scratch.path("runs");
         let codex = scratch.script("codex", &format!("#!/bin/sh\necho $$ >> {}\nsleep 30", log.display()));
@@ -1627,23 +1646,28 @@ mod tests {
         };
         let budget = Duration::from_millis(1000);
         let (tx, rx) = std::sync::mpsc::channel();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
         let first_codex = codex.clone();
         std::thread::spawn(move || {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            // Held from its spawn on: a busy machine can pass the deadline,
+            // and kill and reap the server, before this test could read its
+            // pid.
+            let _ = hold_tx.send(hold_next_reap());
             let deadline = Instant::now() + budget;
             let _ = tx.send(read_rate_limits(&CodexBin { path: first_codex, child_path: None }, deadline));
         });
-        assert!(wait_until(40, || runs(&log).len() == 1));
-        let pid = runs(&log)[0];
+        let (reap, spawned) = hold_rx.recv_timeout(Duration::from_secs(10)).expect("the probe never started");
+        let pid = spawned.recv_timeout(Duration::from_secs(10)).expect("the probe spawned no app server");
         assert!(pid > 1, "bad pid {pid}");
-        let release = hold(pid as u32);
+        let release = hold(pid as u32, reap);
         let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
         let (second, second_took) = probe(&codex, Duration::from_secs(2));
-        let started_while_stuck = runs(&log).len();
+        let started_while_stuck = runs_besides(&log, pid);
         let (other_result, _) = probe(&other, Duration::from_millis(300));
         drop(release);
         assert_eq!(expect_err(first.expect("read_rate_limits never returned")).code, ErrorCode::Timeout);
-        assert_eq!(started_while_stuck, 1, "a second app server was started while the first was stuck");
+        assert_eq!(started_while_stuck, 0, "a second app server was started while the first was stuck");
         let second = expect_err(second);
         assert_eq!((second.code, second.detail.as_str()), (ErrorCode::Failed, "an earlier codex app-server is stuck"));
         assert!(second_took < Duration::from_millis(500), "the refusal took {second_took:?}");
@@ -1655,7 +1679,7 @@ mod tests {
         );
         let (third, _) = probe(&codex, Duration::from_millis(300));
         assert_eq!(expect_err(third).code, ErrorCode::Timeout);
-        assert_eq!(runs(&log).len(), 2, "the app server was not started again once reaped");
+        assert_eq!(runs_besides(&log, pid), 1, "the app server was not started again once reaped");
     }
 
     /// The same for the login-shell lookup: while its shell is stuck, the
@@ -1679,23 +1703,27 @@ mod tests {
         };
         let budget = Duration::from_millis(1000);
         let (tx, rx) = std::sync::mpsc::channel();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
         let first_shell = shell.clone();
         std::thread::spawn(move || {
+            // Held from its spawn on: a busy machine can pass the deadline,
+            // and kill and reap the shell, before this test could read its
+            // pid.
+            let _ = hold_tx.send(hold_next_reap());
             let _ = tx.send(lookup(&first_shell, budget).0);
         });
-        assert!(wait_until(40, || runs(&log).len() == 1));
-        let pid = runs(&log)[0];
+        let (release, spawned) = hold_rx.recv_timeout(Duration::from_secs(10)).expect("the lookup never started");
+        let pid = spawned.recv_timeout(Duration::from_secs(10)).expect("the lookup spawned no shell");
         assert!(pid > 1, "bad pid {pid}");
-        let release = CHILDREN.hold_reap(pid as u32);
         let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
         let (second, second_took) = lookup(&shell, Duration::from_secs(2));
-        let started_while_stuck = runs(&log).len();
+        let started_while_stuck = runs_besides(&log, pid);
         let (other_result, _) = lookup(&other, Duration::from_secs(5));
         drop(release);
         let first = first.expect("the lookup never returned");
         let first = first.map(|c| c.map(|c| c.path)).expect_err("a shell killed at its bound gave an answer");
         assert_eq!(first.code, ErrorCode::Timeout, "killed at its bound: {first:?}");
-        assert_eq!(started_while_stuck, 1, "a second shell was started while the first was stuck");
+        assert_eq!(started_while_stuck, 0, "a second shell was started while the first was stuck");
         let second = second.map(|c| c.map(|c| c.path)).expect_err("the stuck shell's lookup did not fail");
         assert_eq!((second.code, second.detail.as_str()), (ErrorCode::Failed, "an earlier login shell is stuck"));
         assert!(second_took < Duration::from_millis(500), "the refusal took {second_took:?}");
@@ -1705,7 +1733,7 @@ mod tests {
         assert!(wait_until(40, || !CHILDREN.contains(pid as u32)), "shell {pid} is still in CHILDREN once released");
         let (third, _) = lookup(&shell, Duration::from_millis(300));
         assert_eq!(third.map(|c| c.map(|c| c.path)).map_err(|e| e.code).expect_err("no timeout"), ErrorCode::Timeout);
-        assert_eq!(runs(&log).len(), 2, "the shell was not started again once reaped");
+        assert_eq!(runs_besides(&log, pid), 1, "the shell was not started again once reaped");
     }
 
     /// What codex_from_login_shell finds through `shell` with `budget`, as a
