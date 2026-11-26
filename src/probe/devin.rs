@@ -422,7 +422,7 @@ mod tests {
     }
 
     fn resolve(script: &str) -> Result<Vec<SocketAddr>, ureq::Error> {
-        resolve_uri(&sh_resolver(script, Duration::from_secs(5)), "https://example.com/", &Config::default())
+        resolve_timed(|| sh_resolver(script, Duration::from_secs(5))).0
     }
 
     /// The lookup of example.com through the resolver `make` builds, and how
