@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -25,14 +26,17 @@ const PIPE_READ_BURST: usize = 64 * 1024;
 /// spawn returns only once the child has exec'd, which can stall on a hung
 /// mount, and quitting must still restore the terminal.
 const SPAWN_WAIT: Duration = Duration::from_millis(500);
-/// Longest `reap_killed` waits for a child sent SIGKILL to exit before it
-/// leaves the reap to a reaper thread. SIGKILL ends a process as soon as it
-/// next runs, and even a large one is torn down well within this; one still
-/// there is stuck in a kernel call that ignores signals (a hung NFS or FUSE
-/// mount, a stuck device), which can last indefinitely, so waiting longer
-/// would only hold the probe's result past its deadline. Too short only
-/// starts a reaper thread that isn't needed.
+/// Longest `reap_killed` waits for a child sent SIGKILL, and the rest of its
+/// process group, to exit before it leaves the reap to a reaper thread.
+/// SIGKILL ends a process as soon as it next runs, and even a large one is
+/// torn down well within this; one still there is stuck in a kernel call that
+/// ignores signals (a hung NFS or FUSE mount, a stuck device), which can last
+/// indefinitely, so waiting longer would only hold the probe's result past its
+/// deadline. Too short only starts a reaper thread that isn't needed.
 pub(super) const REAP_WAIT: Duration = Duration::from_millis(250);
+/// How often a reaper thread checks whether the group of the exited leader it
+/// waits on has emptied: a stuck member gives no signal when it ends.
+const GROUP_POLL: Duration = Duration::from_millis(200);
 
 /// The process groups of every live child the probes started.
 pub(super) static CHILDREN: Children = Children::new();
@@ -150,8 +154,8 @@ impl BoundedOutput {
 /// a reaper thread (`reap_killed`). The lock is never held across a spawn
 /// (fork and exec, which can stall on a hung mount) or a wait on a child or its
 /// output, so one probe's spawn never waits for another's, and `kill_all`
-/// waits at most SPAWN_WAIT, for spawns in flight. While a leader SIGKILL
-/// couldn't end waits in a reaper thread, no child of its program is spawned
+/// waits at most SPAWN_WAIT, for spawns in flight. While a group SIGKILL
+/// couldn't empty waits in a reaper thread, no child of its program is spawned
 /// (`spawn`), so retries against a cause that persists (a hung mount) don't
 /// add one stuck child each.
 pub(super) struct Children {
@@ -162,6 +166,10 @@ pub(super) struct Children {
     /// child, until the paired Sender (`hold_reap`) is dropped.
     #[cfg(test)]
     held: Mutex<Vec<(libc::pid_t, std::sync::mpsc::Receiver<()>)>>,
+    /// Test hook: groups that look as if a member SIGKILL couldn't end were
+    /// still in them, until the paired Sender (`hold_group`) is dropped.
+    #[cfg(test)]
+    held_groups: Mutex<Vec<(libc::pid_t, std::sync::mpsc::Receiver<()>)>>,
 }
 
 struct Groups {
@@ -191,7 +199,8 @@ struct Leader {
     /// children run their own (the codex app server, the login shell, this
     /// binary for Devin's lookup).
     program: OsString,
-    /// `reap_killed` left it to a reaper thread: SIGKILL hasn't ended it.
+    /// `reap_killed` left it to a reaper thread: SIGKILL hasn't ended it, or
+    /// another member of its group.
     stuck: bool,
 }
 
@@ -202,6 +211,8 @@ impl Children {
             spawn_done: Condvar::new(),
             #[cfg(test)]
             held: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            held_groups: Mutex::new(Vec::new()),
         }
     }
 
@@ -214,8 +225,8 @@ impl Children {
     /// process exits can leave a child that outlives the quit. A killed child is
     /// still returned, for the caller to reap through `reap`. Fails without
     /// spawning while an earlier child of the same program is stuck
-    /// (`is_stuck`): whatever kept SIGKILL from ending it would most likely
-    /// catch this one too.
+    /// (`is_stuck`), with ErrorKind::ResourceBusy: whatever kept SIGKILL from
+    /// ending it would most likely catch this one too.
     pub(super) fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
         {
             let mut groups = self.lock();
@@ -223,7 +234,10 @@ impl Children {
                 return Err(std::io::Error::other("quitting: no new child"));
             }
             if groups.is_stuck(cmd.get_program()) {
-                return Err(std::io::Error::other("an earlier child of this program is stuck"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "an earlier child of this program is stuck",
+                ));
             }
             groups.spawning += 1;
         }
@@ -261,26 +275,33 @@ impl Children {
     }
 
     /// Reap `child`, whose group was just sent SIGKILL, and return its status,
-    /// if it exits within REAP_WAIT. SIGKILL can't end a leader in
-    /// uninterruptible sleep (a hung mount) until its kernel call returns, so
-    /// one that hasn't exited by then is left to a reaper thread, which waits
-    /// for its exit without a bound and reaps it through `reap`, and None is
-    /// returned. Its group stays recorded until then, so `kill_all` still
-    /// signals it, and its pid, held by the unreaped leader, can't be reused
-    /// while recorded. Until then the leader counts as stuck, and `spawn`
+    /// if it exits within REAP_WAIT and no other member of its group is left
+    /// alive by then. SIGKILL can't end a process in uninterruptible sleep (a
+    /// hung mount) until its kernel call returns, and that may be a member the
+    /// leader started (the native codex under the npm shim's node, a command
+    /// the login config runs) rather than the leader. So a child that hasn't
+    /// exited by then, or whose group hasn't emptied, is left to a reaper
+    /// thread, which waits without a bound for its exit and then for its group
+    /// to empty, and reaps it through `reap`, and None is returned. Its group
+    /// stays recorded until then, so `kill_all` still signals it, and its pid,
+    /// held by the unreaped leader, can't be reused while recorded, as a pid
+    /// or as a group id. Until then the leader counts as stuck, and `spawn`
     /// refuses its program. If the thread can't be started, the leader is never
     /// reaped and its group stays recorded: it holds its pid, and its program
-    /// stays refused, until we exit.
+    /// stays refused, until we exit. A descendant that left the group
+    /// (`setsid`) is not waited for: nothing can tell it from an unrelated
+    /// process. Outside Linux the group isn't checked, only the leader.
     pub(super) fn reap_killed(&'static self, mut child: Child) -> Option<ExitStatus> {
+        let group = child.id() as libc::pid_t;
         let end = Instant::now() + REAP_WAIT;
         // Failing to check on it counts as exited: `wait` then fails at once
-        // (no such child) rather than blocking.
-        while !(has_exited(&child).unwrap_or(true) && !self.is_held(&child)) {
+        // (no such child) rather than blocking. The group is checked only
+        // once the leader has exited: until then it is a live member itself.
+        while !(has_exited(&child).unwrap_or(true) && !self.is_held(&child) && self.group_is_empty(group)) {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 // Marked before the reaper starts: once it reaps the leader,
                 // its pid may be reused by a child this would mark instead.
-                let group = child.id() as libc::pid_t;
                 if let Some(leader) = self.lock().leaders.iter_mut().find(|leader| leader.group == group) {
                     leader.stuck = true;
                 }
@@ -288,6 +309,11 @@ impl Children {
                     #[cfg(test)]
                     self.wait_until_released(&child);
                     wait_exited(&child);
+                    // The leader is exited but unreaped, so `group` is still
+                    // its group: no other can take the id.
+                    while !self.group_is_empty(group) {
+                        std::thread::sleep(GROUP_POLL);
+                    }
                     let _ = self.reap(&mut child);
                 });
                 return None;
@@ -364,6 +390,34 @@ impl Children {
 
     #[cfg(not(test))]
     fn is_held(&self, _child: &Child) -> bool {
+        false
+    }
+
+    /// Whether no process is left alive in `group`, whose leader has exited
+    /// unreaped (zombies don't count).
+    fn group_is_empty(&self, group: libc::pid_t) -> bool {
+        !group_has_live_member(Path::new("/proc"), group) && !self.is_group_held(group)
+    }
+
+    /// Test hook: make `group` look as if a member SIGKILL couldn't end were
+    /// still in it, until the returned Sender is dropped.
+    #[cfg(test)]
+    pub(super) fn hold_group(&self, group: u32) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        self.held_groups.lock().unwrap_or_else(PoisonError::into_inner).push((group as libc::pid_t, held));
+        release
+    }
+
+    /// Test hook: whether `group` is held as not empty.
+    #[cfg(test)]
+    fn is_group_held(&self, group: libc::pid_t) -> bool {
+        let held = self.held_groups.lock().unwrap_or_else(PoisonError::into_inner);
+        held.iter()
+            .any(|(id, held)| *id == group && matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)))
+    }
+
+    #[cfg(not(test))]
+    fn is_group_held(&self, _group: libc::pid_t) -> bool {
         false
     }
 
@@ -445,6 +499,64 @@ pub(super) fn has_exited(child: &Child) -> std::io::Result<bool> {
     // SAFETY: waitid succeeded; with WNOHANG, si_pid stays 0 until the child
     // has exited.
     Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Whether a process in process group `group` is alive, as procfs mounted at
+/// `proc` shows it: one with a thread that isn't a zombie, so a zombie leader
+/// whose other threads are stuck counts as alive. Reads only `stat` files,
+/// which don't block on a stuck process (`cmdline` can). What they hold is
+/// parsed without trusting it: a process name may hold anything, and an
+/// entry that can't be read or parsed (gone meanwhile) counts as not a member.
+#[cfg(target_os = "linux")]
+fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else { return false };
+    entries.filter_map(Result::ok).any(|entry| {
+        let is_pid =
+            entry.file_name().to_str().is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid {
+            return false;
+        }
+        let path = entry.path();
+        match stat_state_and_group(&path.join("stat")) {
+            Some((state, pgrp)) if pgrp == group => is_live_state(&state) || has_live_thread(&path),
+            _ => false,
+        }
+    })
+}
+
+/// Outside Linux there is no procfs to read: no member is seen, and only the
+/// leader is waited for.
+#[cfg(not(target_os = "linux"))]
+fn group_has_live_member(_proc: &Path, _group: libc::pid_t) -> bool {
+    false
+}
+
+/// The state and process group in a `/proc/<pid>/stat` (or task) file:
+/// "pid (comm) state ppid pgrp ...". The comm may hold anything, `)` and
+/// spaces included, so fields are counted after its last `)`.
+#[cfg(target_os = "linux")]
+fn stat_state_and_group(path: &Path) -> Option<(String, libc::pid_t)> {
+    let stat = std::fs::read_to_string(path).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?.to_owned();
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
+/// A state other than zombie (Z) or dead (X, briefly, while being reaped).
+#[cfg(target_os = "linux")]
+fn is_live_state(state: &str) -> bool {
+    !matches!(state, "Z" | "X")
+}
+
+/// Whether a thread of the process at `path` (`/proc/<pid>`) is alive.
+#[cfg(target_os = "linux")]
+fn has_live_thread(path: &Path) -> bool {
+    let Ok(tasks) = std::fs::read_dir(path.join("task")) else { return false };
+    tasks
+        .filter_map(Result::ok)
+        .any(|task| stat_state_and_group(&task.path().join("stat")).is_some_and(|(state, _)| is_live_state(&state)))
 }
 
 /// Block until `child` has exited, without reaping it: `has_exited` without
@@ -1039,5 +1151,174 @@ mod tests {
         assert!(!stuck, "an unrecorded child marked /bin/sh stuck");
         assert_eq!(ran.as_deref(), Some(&b"ran\n"[..]));
         assert!(wait_until(40, || !is_our_zombie(group)), "the reaper never reaped {group}");
+    }
+
+    /// `sleep 30` joined to `group`, whose leader may already be dead: the
+    /// group lives while its unreaped leader holds the id.
+    fn join_group(group: libc::pid_t) -> Child {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        Command::new("sleep")
+            .arg("30")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .process_group(group)
+            .spawn()
+            .expect("cannot join the group")
+    }
+
+    /// Review of #40: a leader that dies on SIGKILL at once doesn't make its
+    /// group done while a member lives on (as the native codex under the npm
+    /// shim's node, stuck on a hung mount, would): the reap is left to a
+    /// reaper thread, the program counts as stuck, and only once the group
+    /// has emptied is the leader reaped and its group forgotten.
+    #[test]
+    fn reap_killed_waits_for_the_group_to_empty_not_just_the_leader() {
+        static CHILDREN: Children = Children::new();
+        let mut cmd = sh("exec sleep 30");
+        cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).process_group(0);
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            CHILDREN.spawn(&mut cmd).expect("cannot spawn")
+        };
+        let group = child.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        // SAFETY: killpg only sends a signal. `group` leads the group
+        // process_group(0) created, and nothing reaps it before reap_killed.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        assert!(wait_until(40, || is_our_zombie(group)), "leader {group} never died");
+        // Joined after the SIGKILL, so it lives on, as a member SIGKILL
+        // couldn't end would.
+        let mut member = join_group(group);
+        let (status, elapsed) = promptly(move || {
+            let start = Instant::now();
+            (CHILDREN.reap_killed(child), start.elapsed())
+        });
+        let stuck = CHILDREN.is_stuck(OsStr::new("/bin/sh"));
+        let recorded = CHILDREN.contains(group as u32);
+        let unreaped = is_our_zombie(group);
+        let reaped_with_a_member = wait_until(6, || !CHILDREN.contains(group as u32));
+        // The group empties.
+        let _ = member.kill();
+        let _ = member.wait();
+        assert_eq!(status, None, "the leader was reaped while its group had a live member");
+        assert!(elapsed >= REAP_WAIT, "gave up after {elapsed:?}");
+        assert!(stuck, "a group with a live member left its program free");
+        assert!(recorded, "group {group} was forgotten while it had a live member");
+        assert!(unreaped, "leader {group} was reaped while its group had a live member");
+        assert!(!reaped_with_a_member, "the reaper reaped {group} while its group had a live member");
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once empty");
+        assert!(!CHILDREN.is_stuck(OsStr::new("/bin/sh")), "still stuck once reaped");
+        assert!(wait_until(40, || !is_our_zombie(group)), "the reaper never reaped {group}");
+    }
+
+    /// The group check on the real /proc: a live leader, then a live member
+    /// once the leader is a zombie, count; zombies alone don't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_has_live_member_sees_live_members_and_not_zombies() {
+        let proc = Path::new("/proc");
+        let mut leader = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            Command::new("sleep")
+                .arg("30")
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("cannot spawn")
+        };
+        let group = leader.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        let with_leader = group_has_live_member(proc, group);
+        let mut member = join_group(group);
+        let _ = leader.kill();
+        let leader_died = wait_until(40, || is_our_zombie(group));
+        let with_member = group_has_live_member(proc, group);
+        let _ = member.kill();
+        let _ = member.wait();
+        let with_zombie_leader = group_has_live_member(proc, group);
+        let _ = leader.wait();
+        assert!(with_leader, "the live leader of {group} was not seen");
+        assert!(leader_died, "leader {group} never died");
+        assert!(with_member, "the live member of {group} was not seen");
+        assert!(!with_zombie_leader, "the zombie leader of {group} counted as live");
+    }
+
+    /// The group check on a made-up procfs: what counts as a live member,
+    /// and stat files that are odd, malformed or missing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_has_live_member_reads_procfs_without_trusting_it() {
+        use crate::probe::tests::Scratch;
+        let scratch = Scratch::new("procfs");
+        let group = 4242;
+        // Each case: entries (name, its stat, its tasks' stats), and whether
+        // group 4242 has a live member.
+        // A /proc entry: its name, its stat, and its tasks' stats.
+        type Entry<'a> = (&'a str, Option<&'a str>, &'a [&'a str]);
+        let cases: [(&str, &[Entry], bool); 14] = [
+            ("empty", &[], false),
+            ("running", &[("100", Some("100 (sleep) R 1 4242 4242 0"), &[])], true),
+            ("sleeping", &[("100", Some("100 (sleep) S 1 4242 4242 0"), &[])], true),
+            ("uninterruptible", &[("100", Some("100 (codex) D 1 4242 4242 0"), &[])], true),
+            ("other group", &[("100", Some("100 (sleep) R 1 4243 4243 0"), &[])], false),
+            ("zombie", &[("100", Some("100 (sh) Z 1 4242 4242 0"), &["100 (sh) Z 1 4242"])], false),
+            ("dead", &[("100", Some("100 (sh) X 1 4242 4242 0"), &[])], false),
+            (
+                "zombie leader, stuck thread",
+                &[("100", Some("100 (node) Z 1 4242 4242 0"), &["100 (node) Z 1 4242", "101 (node) D 1 4242"])],
+                true,
+            ),
+            // A name that looks like the fields: they come after its last ')'.
+            ("name mimics a live member", &[("100", Some("100 (x) R 1 4242 (y) Z 1 99 99 0"), &[])], false),
+            ("name mimics a zombie", &[("100", Some("100 (a) Z 1 1 (b) S 1 4242 4242 0"), &[])], true),
+            (
+                "malformed",
+                &[
+                    ("100", Some("garbage"), &[]),
+                    ("101", Some("101 (x)"), &[]),
+                    ("102", Some("102 (x) S 1 not-a-group 0"), &[]),
+                    ("103", Some(""), &[]),
+                ],
+                false,
+            ),
+            ("no stat", &[("100", None, &[])], false),
+            (
+                "not a pid",
+                &[("self", Some("1 (x) R 1 4242 4242 0"), &[]), ("12a", Some("1 (x) R 1 4242 4242 0"), &[])],
+                false,
+            ),
+            (
+                "one live among others",
+                &[
+                    ("100", Some("100 (sh) Z 1 4242 4242 0"), &["100 (sh) Z 1 4242"]),
+                    ("101", Some("101 (vim) S 1 7 7 0"), &[]),
+                    ("102", Some("102 (sleep) S 100 4242 4242 0"), &[]),
+                ],
+                true,
+            ),
+        ];
+        for (i, (name, entries, live)) in cases.iter().enumerate() {
+            let proc = scratch.path(&format!("proc{i}"));
+            std::fs::create_dir(&proc).unwrap();
+            for (pid, stat, tasks) in entries.iter() {
+                let dir = proc.join(pid);
+                std::fs::create_dir_all(dir.join("task")).unwrap();
+                if let Some(stat) = stat {
+                    std::fs::write(dir.join("stat"), stat).unwrap();
+                }
+                for (t, task) in tasks.iter().enumerate() {
+                    let task_dir = dir.join("task").join(t.to_string());
+                    std::fs::create_dir(&task_dir).unwrap();
+                    std::fs::write(task_dir.join("stat"), task).unwrap();
+                }
+            }
+            assert_eq!(group_has_live_member(&proc, group), *live, "{name}");
+        }
+        assert!(!group_has_live_member(&scratch.path("missing"), group), "a missing procfs");
     }
 }

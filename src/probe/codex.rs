@@ -434,12 +434,15 @@ pub fn fetch() -> ProbeResult {
 /// stop it. Fails without starting it while an earlier one is stuck
 /// (`Children::spawn` refuses it).
 fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
-    if CHILDREN.is_stuck(codex.path.as_os_str()) {
-        return Err(ProbeError::new(ErrorCode::Failed, "an earlier codex app-server is stuck"));
-    }
-    let mut child = CHILDREN
-        .spawn(&mut app_server_command(codex, std::env::var_os("PATH").as_deref()))
-        .map_err(|e| ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}")))?;
+    let mut child =
+        CHILDREN.spawn(&mut app_server_command(codex, std::env::var_os("PATH").as_deref())).map_err(|e| {
+            // Refused, not missing: codex may be installed all the same.
+            if e.kind() == std::io::ErrorKind::ResourceBusy {
+                ProbeError::new(ErrorCode::Failed, "an earlier codex app-server is stuck")
+            } else {
+                ProbeError::new(ErrorCode::Missing, format!("cannot start codex: {e}"))
+            }
+        })?;
 
     let result = (|| {
         let mut rpc = Rpc::spawn(&mut child, deadline)?;
@@ -1475,7 +1478,21 @@ mod tests {
     /// the next probe starts it again.
     #[test]
     fn app_server_is_not_started_again_while_an_earlier_one_is_stuck() {
-        let scratch = Scratch::new("rpcagain");
+        assert_app_server_not_started_again_while_stuck("rpcagain", |pid| CHILDREN.hold_reap(pid));
+    }
+
+    /// The same when the server exits but a process it started can't be ended
+    /// (the npm shim's node exits, the native codex under it is stuck).
+    #[test]
+    fn app_server_is_not_started_again_while_a_process_it_started_is_stuck() {
+        assert_app_server_not_started_again_while_stuck("rpcmember", |group| CHILDREN.hold_group(group));
+    }
+
+    /// An app server that starts a process (as the npm shim does), with `hold`
+    /// making it stuck once SIGKILL reaches it; the probes as the tests above
+    /// describe. Scratch dirs are named after `test`.
+    fn assert_app_server_not_started_again_while_stuck(test: &str, hold: impl Fn(u32) -> std::sync::mpsc::Sender<()>) {
+        let scratch = Scratch::new(test);
         let log = scratch.path("runs");
         let codex = scratch.script("codex", &format!("#!/bin/sh\necho $$ >> {}\nsleep 30", log.display()));
         let other_log = scratch.path("other-runs");
@@ -1497,7 +1514,7 @@ mod tests {
         assert!(wait_until(40, || runs(&log).len() == 1));
         let pid = runs(&log)[0];
         assert!(pid > 1, "bad pid {pid}");
-        let release = CHILDREN.hold_reap(pid as u32);
+        let release = hold(pid as u32);
         let first = rx.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3));
         let (second, second_took) = probe(&codex, Duration::from_secs(2));
         let started_while_stuck = runs(&log).len();
