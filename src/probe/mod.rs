@@ -314,6 +314,15 @@ mod tests {
         format!("0.000{random:09}")
     }
 
+    /// Whether `pid` is a zombie child of ours: exited, not reaped yet.
+    pub(super) fn is_our_zombie(pid: libc::pid_t) -> bool {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // "pid (comm) state ppid ...": comm may hold anything, so count fields
+        // after its last ')'.
+        let fields: Vec<&str> = stat.rsplit_once(')').map_or("", |(_, rest)| rest).split_whitespace().collect();
+        fields.first() == Some(&"Z") && fields.get(1).and_then(|p| p.parse().ok()) == Some(std::process::id())
+    }
+
     /// Pids of live (not zombie) processes whose command line has `token`.
     pub(super) fn live_with(token: &str) -> Vec<String> {
         let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };

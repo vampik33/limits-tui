@@ -24,6 +24,14 @@ const PIPE_READ_BURST: usize = 64 * 1024;
 /// spawn returns only once the child has exec'd, which can stall on a hung
 /// mount, and quitting must still restore the terminal.
 const SPAWN_WAIT: Duration = Duration::from_millis(500);
+/// Longest `reap_killed` waits for a child sent SIGKILL to exit before it
+/// leaves the reap to a reaper thread. SIGKILL ends a process as soon as it
+/// next runs, and even a large one is torn down well within this; one still
+/// there is stuck in a kernel call that ignores signals (a hung NFS or FUSE
+/// mount, a stuck device), which can last indefinitely, so waiting longer
+/// would only hold the probe's result past its deadline. Too short only
+/// starts a reaper thread that isn't needed.
+pub(super) const REAP_WAIT: Duration = Duration::from_millis(250);
 
 /// The process groups of every live child the probes started.
 pub(super) static CHILDREN: Children = Children::new();
@@ -137,14 +145,19 @@ impl BoundedOutput {
 /// Process groups of live children, for `kill_all` to kill when the TUI quits:
 /// the probe threads that would kill them are detached and die with the
 /// process. A group is recorded from its spawn until just before its leader is
-/// reaped. The lock is never held across a spawn (fork and exec, which can
-/// stall on a hung mount) or a wait on a child or its output, so one probe's
-/// spawn never waits for another's, and `kill_all` waits at most SPAWN_WAIT,
-/// for spawns in flight.
+/// reaped, by its probe thread or, if it doesn't exit promptly on SIGKILL, by
+/// a reaper thread (`reap_killed`). The lock is never held across a spawn
+/// (fork and exec, which can stall on a hung mount) or a wait on a child or its
+/// output, so one probe's spawn never waits for another's, and `kill_all`
+/// waits at most SPAWN_WAIT, for spawns in flight.
 pub(super) struct Children {
     groups: Mutex<Groups>,
     /// Signalled at the end of each spawn, for `kill_all` to stop waiting.
     spawn_done: Condvar,
+    /// Test hook: reaps held back, by pid, as if SIGKILL couldn't end the
+    /// child, until the paired Sender (`hold_reap`) is dropped.
+    #[cfg(test)]
+    held: Mutex<Vec<(libc::pid_t, std::sync::mpsc::Receiver<()>)>>,
 }
 
 struct Groups {
@@ -159,7 +172,12 @@ struct Groups {
 
 impl Children {
     const fn new() -> Self {
-        Self { groups: Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }), spawn_done: Condvar::new() }
+        Self {
+            groups: Mutex::new(Groups { live: Vec::new(), closed: false, spawning: 0 }),
+            spawn_done: Condvar::new(),
+            #[cfg(test)]
+            held: Mutex::new(Vec::new()),
+        }
     }
 
     /// Spawn `cmd`, which must set `process_group(0)`, and record its group.
@@ -206,10 +224,40 @@ impl Children {
         child.wait()
     }
 
+    /// Reap `child`, whose group was just sent SIGKILL, and return its status,
+    /// if it exits within REAP_WAIT. SIGKILL can't end a leader in
+    /// uninterruptible sleep (a hung mount) until its kernel call returns, so
+    /// one that hasn't exited by then is left to a reaper thread, which waits
+    /// for its exit without a bound and reaps it through `reap`, and None is
+    /// returned. Its group stays recorded until then, so `kill_all` still
+    /// signals it, and its pid, held by the unreaped leader, can't be reused
+    /// while recorded. If the thread can't be started, the leader is never
+    /// reaped and its group stays recorded: it holds its pid until we exit.
+    pub(super) fn reap_killed(&'static self, mut child: Child) -> Option<ExitStatus> {
+        let end = Instant::now() + REAP_WAIT;
+        // Failing to check on it counts as exited: `wait` then fails at once
+        // (no such child) rather than blocking.
+        while !(has_exited(&child).unwrap_or(true) && !self.is_held(&child)) {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
+                    #[cfg(test)]
+                    self.wait_until_released(&child);
+                    wait_exited(&child);
+                    let _ = self.reap(&mut child);
+                });
+                return None;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(10)));
+        }
+        self.reap(&mut child).ok()
+    }
+
     /// Refuse new children, wait up to SPAWN_WAIT for spawns in flight to
     /// record theirs, then SIGKILL every recorded group. A spawn that ends
     /// after the wait kills its own child (see `spawn`). Doesn't wait for
-    /// anything to exit: the probe threads (or init, once we exit) reap them.
+    /// anything to exit: the probe and reaper threads (or init, once we exit)
+    /// reap them.
     pub(super) fn kill_all(&self) {
         let mut groups = self.lock();
         groups.closed = true;
@@ -244,11 +292,47 @@ impl Children {
     pub(super) fn contains(&self, pid: u32) -> bool {
         self.lock().live.contains(&(pid as libc::pid_t))
     }
+
+    /// Test hook: hold back the reap of child `pid` as if SIGKILL couldn't end
+    /// it, until the returned Sender is dropped.
+    #[cfg(test)]
+    pub(super) fn hold_reap(&self, pid: u32) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        self.held.lock().unwrap_or_else(PoisonError::into_inner).push((pid as libc::pid_t, held));
+        release
+    }
+
+    /// Test hook: whether the reap of `child` is held back.
+    #[cfg(test)]
+    fn is_held(&self, child: &Child) -> bool {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.iter().any(|(pid, held)| {
+            *pid == child.id() as libc::pid_t && matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        })
+    }
+
+    #[cfg(not(test))]
+    fn is_held(&self, _child: &Child) -> bool {
+        false
+    }
+
+    /// Test hook: wait until the reap of `child` is no longer held back.
+    #[cfg(test)]
+    fn wait_until_released(&self, child: &Child) {
+        let held = {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(i) = held.iter().position(|(pid, _)| *pid == child.id() as libc::pid_t) else { return };
+            held.swap_remove(i).1
+        };
+        // Not under the lock: other reaps and holds go on meanwhile.
+        let _ = held.recv();
+    }
 }
 
 /// The last OUTPUT_CAP bytes of stdout of `cmd`, or None if it could not be
-/// started. Returns by `deadline`, apart from reaping a killed child. Before it
-/// returns, the child's process group is killed: the child itself if it is
+/// started. Returns by `deadline`, plus up to REAP_WAIT to reap the killed
+/// child (`Children::reap_killed`). Before it returns, the child's process
+/// group is killed: the child itself if it is
 /// still running at the deadline, and every background job left in the group,
 /// whether or not it still holds stdout. Holders outside that group (setsid)
 /// can't be reached, but the read end is closed on return, so nothing outlives
@@ -260,7 +344,7 @@ pub(super) fn run_bounded(cmd: &mut Command, deadline: Instant) -> Option<Vec<u8
 }
 
 /// `run_bounded`, recording the child in `children`.
-fn run_bounded_with(children: &Children, cmd: &mut Command, deadline: Instant) -> Option<Vec<u8>> {
+fn run_bounded_with(children: &'static Children, cmd: &mut Command, deadline: Instant) -> Option<Vec<u8>> {
     // A non-interactive shell keeps its background jobs in this group.
     cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
     let mut child = children.spawn(cmd).ok()?;
@@ -284,15 +368,15 @@ fn run_bounded_with(children: &Children, cmd: &mut Command, deadline: Instant) -
     // in it.
     // SAFETY: killpg only sends a signal. The group id is the pid of our
     // child, which leads the group created by process_group(0). Only
-    // `children.reap` below reaps the child (has_exited uses WNOWAIT), so its
-    // pid, and with it the group id, cannot have been reused yet.
+    // `children.reap_killed` below reaps the child (has_exited uses WNOWAIT),
+    // so its pid, and with it the group id, cannot have been reused yet.
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
     // Killed holders release stdout at once.
     output.settle(deadline);
     let tail = output.into_tail();
-    let _ = children.reap(&mut child);
+    children.reap_killed(child);
     Some(tail)
 }
 
@@ -312,13 +396,28 @@ pub(super) fn has_exited(child: &Child) -> std::io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
+/// Block until `child` has exited, without reaping it: `has_exited` without
+/// WNOHANG. Returns early only if it can't wait on `child` at all.
+fn wait_exited(child: &Child) {
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves the
+        // child to be reaped by `Child::wait`.
+        let rc = unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::mpsc;
 
-    use crate::probe::tests::{live_with, sleep_token};
+    use crate::probe::tests::{is_our_zombie, live_with, promptly, sleep_token};
     use crate::probe::{SCRIPTS, wait_until};
 
     fn sh(script: &str) -> Command {
@@ -487,6 +586,216 @@ mod tests {
         let status = status.expect("the stalled spawn failed");
         assert_eq!(status.signal(), Some(libc::SIGKILL), "the stalled spawn's child ended with {status:?}");
         assert!(CHILDREN.lock().live.is_empty());
+    }
+
+    /// `script` run bounded with `budget` on another thread, its group
+    /// recorded in `children` and its reap held from when it is recorded.
+    /// Returns the group, the hold, the output's receiver and when it started.
+    fn run_held(
+        children: &'static Children,
+        script: &str,
+        budget: Duration,
+    ) -> (libc::pid_t, mpsc::Sender<()>, mpsc::Receiver<Option<Vec<u8>>>, Instant) {
+        let (tx, rx) = mpsc::channel();
+        let mut cmd = sh(script);
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let _ = tx.send(run_bounded_with(children, &mut cmd, Instant::now() + budget));
+        });
+        let group = recorded_group(children);
+        let release = children.hold_reap(group as u32);
+        (group, release, rx, start)
+    }
+
+    /// A child SIGKILL can't end (held as if in uninterruptible sleep) holds
+    /// run_bounded only REAP_WAIT past its deadline. Its group stays recorded,
+    /// its leader unreaped, until a reaper thread reaps it once it exits.
+    #[test]
+    fn run_bounded_returns_by_its_deadline_when_its_child_cannot_be_reaped() {
+        static CHILDREN: Children = Children::new();
+        let budget = Duration::from_millis(1500);
+        let (group, release, done, start) = run_held(&CHILDREN, "echo started; exec sleep 30", budget);
+        let out =
+            done.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3)).expect("the bounded run never returned");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                &b"started
+"[..]
+            )
+        );
+        assert!(elapsed >= budget + REAP_WAIT, "gave up on the reap after {elapsed:?}");
+        assert!(elapsed < budget + REAP_WAIT + Duration::from_secs(1), "took {elapsed:?}");
+        // Checked before the release, asserted after: a failed check must not
+        // leave the reaper waiting.
+        let recorded = CHILDREN.contains(group as u32);
+        let unreaped = is_our_zombie(group);
+        drop(release);
+        assert!(recorded, "group {group} was forgotten before its leader was reaped");
+        assert!(unreaped, "leader {group} was reaped while held, or never killed");
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once released");
+        assert!(wait_until(40, || !is_our_zombie(group)), "the reaper never reaped {group}");
+    }
+
+    /// A quit while the reaper waits still signals the group: here a process
+    /// that joined it after run_bounded's SIGKILL.
+    #[test]
+    fn kill_all_signals_a_group_whose_reap_is_held() {
+        use std::os::unix::process::ExitStatusExt;
+        static CHILDREN: Children = Children::new();
+        let budget = Duration::from_millis(1500);
+        let (group, release, done, _) = run_held(&CHILDREN, "exec sleep 30", budget);
+        done.recv_timeout(budget + REAP_WAIT + Duration::from_secs(3)).expect("the bounded run never returned");
+        assert!(group > 1, "bad group {group}");
+        // The leader is a zombie, but its group lives on until it is reaped.
+        let joined = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            Command::new("sleep")
+                .arg("30")
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .process_group(group)
+                .spawn()
+        };
+        let mut joined = match joined {
+            Ok(joined) => joined,
+            Err(e) => {
+                drop(release);
+                panic!("cannot join group {group}: {e}");
+            }
+        };
+        CHILDREN.kill_all();
+        let mut status = None;
+        let signalled = wait_until(40, || {
+            status = joined.try_wait().ok().flatten();
+            status.is_some()
+        });
+        if !signalled {
+            let _ = joined.kill();
+        }
+        let _ = joined.wait();
+        drop(release);
+        assert!(signalled, "kill_all did not signal held group {group}");
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGKILL));
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once released");
+    }
+
+    /// A child that exits promptly is reaped before run_bounded returns,
+    /// whether it ended by itself or by the SIGKILL at its deadline.
+    #[test]
+    fn run_bounded_reaps_a_child_that_exits_before_it_returns() {
+        static CHILDREN: Children = Children::new();
+        for (script, budget) in
+            [("echo $$", Duration::from_secs(5)), ("echo $$; exec sleep 30", Duration::from_millis(300))]
+        {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            let start = Instant::now();
+            let out = run_bounded_with(&CHILDREN, &mut sh(script), start + budget).expect("not started");
+            let elapsed = start.elapsed();
+            let pid: libc::pid_t = String::from_utf8_lossy(&out).trim().parse().expect("no pid printed");
+            assert!(!is_our_zombie(pid), "{script:?}: {pid} was left unreaped");
+            assert!(!CHILDREN.contains(pid as u32), "{script:?}: {pid} is still recorded");
+            assert!(elapsed < budget + REAP_WAIT, "{script:?}: took {elapsed:?}");
+        }
+    }
+
+    /// The reap of a held child waits out REAP_WAIT and returns None; once
+    /// released, the reaper thread reaps it with nothing more to do.
+    #[test]
+    fn reap_killed_leaves_a_held_child_to_a_reaper_thread() {
+        static CHILDREN: Children = Children::new();
+        let mut cmd = sh("exec sleep 30");
+        cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).process_group(0);
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            CHILDREN.spawn(&mut cmd).expect("cannot spawn")
+        };
+        let group = child.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        let release = CHILDREN.hold_reap(child.id());
+        // SAFETY: killpg only sends a signal. `group` leads the group
+        // process_group(0) created, and nothing reaps it before reap_killed.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        // On another thread: a reap that blocks fails the test instead of
+        // hanging it, and the release, dropped as the test unwinds, frees it.
+        let (status, elapsed) = promptly(move || {
+            let start = Instant::now();
+            (CHILDREN.reap_killed(child), start.elapsed())
+        });
+        let recorded = CHILDREN.contains(group as u32);
+        drop(release);
+        assert_eq!(status, None, "a held child was reaped");
+        assert!(elapsed >= REAP_WAIT, "gave up after {elapsed:?}");
+        assert!(elapsed < REAP_WAIT + Duration::from_millis(500), "took {elapsed:?}");
+        assert!(recorded, "group {group} was forgotten before its leader was reaped");
+        assert!(wait_until(40, || !CHILDREN.contains(group as u32)), "group {group} is still recorded once released");
+        assert!(wait_until(40, || !is_our_zombie(group)), "the reaper never reaped {group}");
+    }
+
+    /// A child that exits promptly on SIGKILL is reaped at once, its status
+    /// returned and its group forgotten.
+    #[test]
+    fn reap_killed_reaps_a_killed_child_at_once() {
+        use std::os::unix::process::ExitStatusExt;
+        static CHILDREN: Children = Children::new();
+        let mut cmd = sh("exec sleep 30");
+        cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).process_group(0);
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            CHILDREN.spawn(&mut cmd).expect("cannot spawn")
+        };
+        let group = child.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        // SAFETY: as in reap_killed_leaves_a_held_child_to_a_reaper_thread.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+        let start = Instant::now();
+        let status = CHILDREN.reap_killed(child);
+        let elapsed = start.elapsed();
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGKILL));
+        assert!(elapsed < REAP_WAIT, "took {elapsed:?}");
+        assert!(!CHILDREN.contains(group as u32));
+        assert!(!is_our_zombie(group));
+    }
+
+    /// The reaper's wait leaves the exited child unreaped, so `reap` can still
+    /// forget its group before its pid is freed.
+    #[test]
+    fn wait_exited_returns_once_the_child_exits_without_reaping_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let child = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            sh("exec sleep 30")
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("cannot spawn")
+        };
+        let pid = child.id() as libc::pid_t;
+        assert!(pid > 1, "bad pid {pid}");
+        let (tx, rx) = mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            wait_exited(&child);
+            let _ = tx.send(());
+            child
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "wait_exited returned while the child ran");
+        // SAFETY: kill only sends a signal. `pid` is our child, which only
+        // the wait below reaps, so the id is still its own.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        rx.recv_timeout(Duration::from_secs(5)).expect("wait_exited never returned after the kill");
+        let mut child = waiting.join().unwrap();
+        assert!(is_our_zombie(pid), "wait_exited reaped {pid}");
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 
     #[test]
