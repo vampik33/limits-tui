@@ -7,7 +7,18 @@ Rust TUI that shows Claude, Codex and Devin usage limits. User-facing setup is i
 - `master` is protected, admins included: branch, open a PR; no direct pushes.
 - Before every commit that touches `src/`, `Cargo.toml` or `Cargo.lock`, run the `verify` skill
   (`.claude/skills/verify/verify.sh`). Plain `cargo test` doesn't drive the TUI.
+  `verify.sh quick` (fmt, clippy, tests) is enough for test-only changes; anything in `src/` needs the full run.
+- Run it: `cargo run -- --once` prints one snapshot; `cargo run` starts the TUI.
 - Don't add dependencies or run `cargo update` unless asked.
+
+## Layout
+
+- `src/main.rs`: CLI flags, `--help`, `--once`, the event loop. `src/ui.rs`: drawing.
+- `src/probe/`: `claude.rs`, `codex.rs`, `devin.rs` (one per source); `child.rs` runs child processes with deadlines
+  and kills their process groups (`CHILDREN` registry); `mod.rs` holds the result types (`FetchOk`, `ProbeError`),
+  JSON and timeout helpers, safe `PATH` handling and `kill_children()`.
+- `tests/resolve_child.rs`: checks that the binary's hidden `__resolve` mode (the DNS lookup child the Devin probe
+  spawns) is dispatched from `main`.
 
 ## Rules
 
