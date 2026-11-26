@@ -314,6 +314,75 @@ mod tests {
         format!("0.000{random:09}")
     }
 
+    /// How `pid`, a child of ours, ended, read without reaping it; None while
+    /// it runs.
+    pub(super) fn unreaped_exit_status(pid: libc::pid_t) -> Option<std::process::ExitStatus> {
+        read_exit_status(pid, libc::WNOHANG)
+    }
+
+    /// `unreaped_exit_status` once `pid` has exited: blocks until then, so
+    /// it returns as soon as the child exits, with no poll to wait out. None
+    /// only if `pid` is no child of ours to wait on.
+    fn wait_unreaped_exit_status(pid: libc::pid_t) -> Option<std::process::ExitStatus> {
+        read_exit_status(pid, 0)
+    }
+
+    /// How `pid`, a child of ours, ended, read by waitid with `flags` added
+    /// to WEXITED | WNOWAIT, which leaves it to be reaped by its owner.
+    fn read_exit_status(pid: libc::pid_t, flags: libc::c_int) -> Option<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: `info` is a valid, writable siginfo_t; WNOWAIT leaves
+            // the child to be reaped by its owner.
+            let rc = unsafe {
+                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT | flags)
+            };
+            if rc == 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+        // SAFETY: waitid succeeded; with WNOHANG, si_pid stays 0 until the
+        // child has exited.
+        if unsafe { info.si_pid() } == 0 {
+            return None;
+        }
+        // SAFETY: the child has exited, so `info` is its SIGCHLD siginfo,
+        // which sets si_status.
+        let status = unsafe { info.si_status() };
+        // As waitpid would report it.
+        let raw = match info.si_code {
+            libc::CLD_EXITED => (status & 0xff) << 8,
+            libc::CLD_KILLED => status,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => return None,
+        };
+        Some(std::process::ExitStatus::from_raw(raw))
+    }
+
+    /// On another thread: wait for the pid `pid` gives, a child of ours, to
+    /// exit, read how it ended without reaping it, then drop `release`, a hold
+    /// on its reap, so no reap can take the status first. Sends the status and
+    /// when the exit was seen (never before it happened), or None if there is
+    /// no pid or it can't be waited on. Blocked until the exit, it adds no
+    /// poll to the reap it holds.
+    pub(super) fn observe_exit(
+        pid: impl FnOnce() -> Option<libc::pid_t> + Send + 'static,
+        release: std::sync::mpsc::Sender<()>,
+    ) -> std::sync::mpsc::Receiver<Option<(std::process::ExitStatus, std::time::Instant)>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let exit = pid().and_then(wait_unreaped_exit_status).map(|status| (status, std::time::Instant::now()));
+            drop(release);
+            let _ = tx.send(exit);
+        });
+        rx
+    }
+
     /// Whether `pid` is a zombie child of ours: exited, not reaped yet.
     pub(super) fn is_our_zombie(pid: libc::pid_t) -> bool {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
