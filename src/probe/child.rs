@@ -290,14 +290,26 @@ impl Children {
     /// reaped and its group stays recorded: it holds its pid, and its program
     /// stays refused, until we exit. A descendant that left the group
     /// (`setsid`) is not waited for: nothing can tell it from an unrelated
-    /// process. Outside Linux the group isn't checked, only the leader.
+    /// process. Outside Linux, or with a /proc from another pid namespace, the
+    /// group isn't checked, only the leader. The group scan reads all of
+    /// /proc, which a loaded host can slow: one begun before REAP_WAIT ends
+    /// may still end after it, so this returns by REAP_WAIT plus that scan.
     pub(super) fn reap_killed(&'static self, mut child: Child) -> Option<ExitStatus> {
         let group = child.id() as libc::pid_t;
         let end = Instant::now() + REAP_WAIT;
-        // Failing to check on it counts as exited: `wait` then fails at once
-        // (no such child) rather than blocking. The group is checked only
-        // once the leader has exited: until then it is a live member itself.
-        while !(has_exited(&child).unwrap_or(true) && !self.is_held(&child) && self.group_is_empty(group)) {
+        loop {
+            // Failing to check on it counts as exited: `wait` then fails at
+            // once (no such child) rather than blocking. The group is checked
+            // only once the leader has exited (until then it is a live member
+            // itself), and not once REAP_WAIT is over: the reaper thread
+            // checks it then.
+            if has_exited(&child).unwrap_or(true)
+                && !self.is_held(&child)
+                && Instant::now() < end
+                && self.group_is_empty(group)
+            {
+                return self.reap(&mut child).ok();
+            }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 // Marked before the reaper starts: once it reaps the leader,
@@ -320,7 +332,6 @@ impl Children {
             }
             std::thread::sleep(left.min(Duration::from_millis(10)));
         }
-        self.reap(&mut child).ok()
     }
 
     /// Refuse new children, wait up to SPAWN_WAIT for spawns in flight to
@@ -382,10 +393,10 @@ impl Children {
     /// Test hook: whether the reap of `child` is held back.
     #[cfg(test)]
     fn is_held(&self, child: &Child) -> bool {
-        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.iter().any(|(pid, held)| {
-            *pid == child.id() as libc::pid_t && matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
-        })
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        // Released holds go: their pids may be reused.
+        held.retain(|(_, held)| matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        held.iter().any(|(pid, _)| *pid == child.id() as libc::pid_t)
     }
 
     #[cfg(not(test))]
@@ -411,9 +422,10 @@ impl Children {
     /// Test hook: whether `group` is held as not empty.
     #[cfg(test)]
     fn is_group_held(&self, group: libc::pid_t) -> bool {
-        let held = self.held_groups.lock().unwrap_or_else(PoisonError::into_inner);
-        held.iter()
-            .any(|(id, held)| *id == group && matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)))
+        let mut held = self.held_groups.lock().unwrap_or_else(PoisonError::into_inner);
+        // Released holds go: their group ids may be reused.
+        held.retain(|(_, held)| matches!(held.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        held.iter().any(|(id, _)| *id == group)
     }
 
     #[cfg(not(test))]
@@ -503,12 +515,19 @@ pub(super) fn has_exited(child: &Child) -> std::io::Result<bool> {
 
 /// Whether a process in process group `group` is alive, as procfs mounted at
 /// `proc` shows it: one with a thread that isn't a zombie, so a zombie leader
-/// whose other threads are stuck counts as alive. Reads only `stat` files,
+/// whose other threads are stuck counts as alive. A procfs of another pid
+/// namespace (`unshare --pid` without remounting /proc) numbers processes
+/// differently: our children aren't found in it, and a process there whose
+/// group id happens to equal our child's pid is not its member, so none is
+/// seen, and only the leader is waited for. Reads only `stat` files,
 /// which don't block on a stuck process (`cmdline` can). What they hold is
 /// parsed without trusting it: a process name may hold anything, and an
 /// entry that can't be read or parsed (gone meanwhile) counts as not a member.
 #[cfg(target_os = "linux")]
 fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
+    if !is_our_procfs(proc) {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(proc) else { return false };
     entries.filter_map(Result::ok).any(|entry| {
         let is_pid =
@@ -522,6 +541,14 @@ fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
             _ => false,
         }
     })
+}
+
+/// Whether procfs at `proc` numbers processes as we do: its `self` names our
+/// pid.
+#[cfg(target_os = "linux")]
+fn is_our_procfs(proc: &Path) -> bool {
+    std::fs::read_link(proc.join("self"))
+        .is_ok_and(|pid| pid.to_str().and_then(|pid| pid.parse::<u32>().ok()) == Some(std::process::id()))
 }
 
 /// Outside Linux there is no procfs to read: no member is seen, and only the
@@ -1256,9 +1283,8 @@ mod tests {
         use crate::probe::tests::Scratch;
         let scratch = Scratch::new("procfs");
         let group = 4242;
-        // Each case: entries (name, its stat, its tasks' stats), and whether
-        // group 4242 has a live member.
-        // A /proc entry: its name, its stat, and its tasks' stats.
+        // A /proc entry: its name, its stat, and its tasks' stats. Each case:
+        // entries, and whether group 4242 has a live member.
         type Entry<'a> = (&'a str, Option<&'a str>, &'a [&'a str]);
         let cases: [(&str, &[Entry], bool); 14] = [
             ("empty", &[], false),
@@ -1289,7 +1315,7 @@ mod tests {
             ("no stat", &[("100", None, &[])], false),
             (
                 "not a pid",
-                &[("self", Some("1 (x) R 1 4242 4242 0"), &[]), ("12a", Some("1 (x) R 1 4242 4242 0"), &[])],
+                &[("sys", Some("1 (x) R 1 4242 4242 0"), &[]), ("12a", Some("1 (x) R 1 4242 4242 0"), &[])],
                 false,
             ),
             (
@@ -1305,6 +1331,8 @@ mod tests {
         for (i, (name, entries, live)) in cases.iter().enumerate() {
             let proc = scratch.path(&format!("proc{i}"));
             std::fs::create_dir(&proc).unwrap();
+            // Ours, as /proc/self says.
+            std::os::unix::fs::symlink(std::process::id().to_string(), proc.join("self")).unwrap();
             for (pid, stat, tasks) in entries.iter() {
                 let dir = proc.join(pid);
                 std::fs::create_dir_all(dir.join("task")).unwrap();
@@ -1320,5 +1348,36 @@ mod tests {
             assert_eq!(group_has_live_member(&proc, group), *live, "{name}");
         }
         assert!(!group_has_live_member(&scratch.path("missing"), group), "a missing procfs");
+    }
+
+    /// A procfs whose `self` isn't our pid (one of another pid namespace) is
+    /// not scanned: only the leader is waited for, so an unrelated process
+    /// that looks like a member there marks nothing stuck.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_has_live_member_skips_a_procfs_of_another_pid_namespace() {
+        use crate::probe::tests::Scratch;
+        let scratch = Scratch::new("procns");
+        let group = 4242;
+        let ours = std::process::id().to_string();
+        let other = (std::process::id() + 1).to_string();
+        // What `self` is in each case, and whether the live member is seen.
+        let cases: [(&str, Option<&str>, bool); 5] = [
+            ("ours", Some(&ours), true),
+            ("another namespace's", Some(&other), false),
+            ("not a pid", Some("self"), false),
+            ("an absolute path", Some(&format!("/proc/{ours}")), false),
+            ("missing", None, false),
+        ];
+        for (i, (name, self_link, seen)) in cases.iter().enumerate() {
+            let proc = scratch.path(&format!("proc{i}"));
+            std::fs::create_dir_all(proc.join("100/task")).unwrap();
+            std::fs::write(proc.join("100/stat"), "100 (sleep) S 1 4242 4242 0").unwrap();
+            if let Some(target) = self_link {
+                std::os::unix::fs::symlink(target, proc.join("self")).unwrap();
+            }
+            assert_eq!(group_has_live_member(&proc, group), *seen, "self {name}");
+        }
+        assert!(is_our_procfs(Path::new("/proc")), "this test's own /proc is not its pid namespace's");
     }
 }
