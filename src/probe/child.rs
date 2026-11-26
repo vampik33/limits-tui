@@ -572,10 +572,12 @@ pub(super) fn has_exited(child: &Child) -> std::io::Result<bool> {
 /// namespace (`unshare --pid` without remounting /proc) numbers processes
 /// differently: our children aren't found in it, and a process there whose
 /// group id happens to equal our child's pid is not its member, so none is
-/// seen, and only the leader is waited for. Reads only `stat` files,
-/// which don't block on a stuck process (`cmdline` can). What they hold is
-/// parsed without trusting it: a process name may hold anything, and an
-/// entry that can't be read or parsed (gone meanwhile) counts as not a member.
+/// seen, and only the leader is waited for. A process getpgid places in
+/// another group is passed over (`in_other_group`); for the rest it reads
+/// only `stat` files, which don't block on a stuck process (`cmdline` can).
+/// What they hold is parsed without trusting it: a process name may hold
+/// anything, and an entry that can't be read or parsed (gone meanwhile)
+/// counts as not a member.
 #[cfg(target_os = "linux")]
 fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
     if !is_our_procfs(proc) {
@@ -583,9 +585,12 @@ fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
     }
     let Ok(entries) = std::fs::read_dir(proc) else { return false };
     entries.filter_map(Result::ok).any(|entry| {
-        let is_pid =
-            entry.file_name().to_str().is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()));
-        if !is_pid {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return false;
+        };
+        if in_other_group(pid, group) {
             return false;
         }
         let path = entry.path();
@@ -602,6 +607,22 @@ fn group_has_live_member(proc: &Path, group: libc::pid_t) -> bool {
 fn is_our_procfs(proc: &Path) -> bool {
     std::fs::read_link(proc.join("self"))
         .is_ok_and(|pid| pid.to_str().and_then(|pid| pid.parse::<u32>().ok()) == Some(std::process::id()))
+}
+
+/// Whether process `pid` (a /proc entry's name) is in a process group other
+/// than `group`, as getpgid tells: one call, where reading its `stat` makes
+/// the kernel build the whole file, so a scan that reads every process's
+/// takes about ten times as long, and on a loaded host can outlast
+/// REAP_WAIT. Only called for a procfs of our pid namespace, whose pids are
+/// the ones getpgid takes. A pid it can't place (gone, never ours, or out
+/// of range) is not known to be elsewhere: its `stat` decides.
+#[cfg(target_os = "linux")]
+fn in_other_group(pid: &str, group: libc::pid_t) -> bool {
+    // Never 0: getpgid(0) is our own group.
+    let Some(pid) = pid.parse::<libc::pid_t>().ok().filter(|&pid| pid > 0) else { return false };
+    // SAFETY: getpgid only reads the process group id of `pid`.
+    let pgid = unsafe { libc::getpgid(pid) };
+    pgid >= 0 && pgid != group
 }
 
 /// Outside Linux there is no procfs to read: no member is seen, and only the
@@ -1471,6 +1492,68 @@ mod tests {
         assert!(!with_zombie_leader, "the zombie leader of {group} counted as live");
     }
 
+    /// A made-up procfs entry's name: a number as `pid` is moved past
+    /// PID_MAX_LIMIT (2^22), where no process is, so getpgid can't place it
+    /// in a group and its made-up `stat` decides; any other name is kept.
+    #[cfg(target_os = "linux")]
+    fn past_pid_max(pid: &str) -> String {
+        pid.parse::<u32>().map_or_else(|_| pid.to_owned(), |pid| (pid + (1 << 22)).to_string())
+    }
+
+    /// A process getpgid places in another group is passed over without its
+    /// `stat` being read; one it places in the group, or can't place, is
+    /// judged by its `stat`. Here the `stat` files are made up and say
+    /// otherwise, so they show which was read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_has_live_member_reads_stat_only_where_getpgid_finds_no_other_group() {
+        use crate::probe::tests::Scratch;
+        let scratch = Scratch::new("procpgid");
+        let mut leader = {
+            let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+            Command::new("sleep")
+                .arg("30")
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("cannot spawn")
+        };
+        let group = leader.id() as libc::pid_t;
+        assert!(group > 1, "bad group {group}");
+        // `stat` of a live member of `group`, or of a zombie one.
+        let live = format!("1 (sleep) S 1 {group} {group} 0");
+        let zombie = format!("1 (sleep) Z 1 {group} {group} 0");
+        let ours = std::process::id().to_string();
+        let unplaced = past_pid_max("100");
+        // Each case: the entry's name, its stat, and whether a live member is
+        // seen.
+        let cases: [(&str, &str, &str, bool); 5] = [
+            ("in another group (this test)", &ours, &live, false),
+            ("in the group, live", &group.to_string(), &live, true),
+            ("in the group, a zombie", &group.to_string(), &zombie, false),
+            ("not placed, live", &unplaced, &live, true),
+            ("not placed, a zombie", &unplaced, &zombie, false),
+        ];
+        let seen: Vec<bool> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name, stat, _))| {
+                let proc = scratch.path(&format!("proc{i}"));
+                std::fs::create_dir_all(proc.join(name).join("task")).unwrap();
+                std::fs::write(proc.join(name).join("stat"), stat).unwrap();
+                std::os::unix::fs::symlink(&ours, proc.join("self")).unwrap();
+                group_has_live_member(&proc, group)
+            })
+            .collect();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        for ((case, _, _, want), seen) in cases.iter().zip(seen) {
+            assert_eq!(seen, *want, "{case}");
+        }
+    }
+
     /// The group check on a made-up procfs: what counts as a live member,
     /// and stat files that are odd, malformed or missing.
     #[cfg(target_os = "linux")]
@@ -1530,7 +1613,7 @@ mod tests {
             // Ours, as /proc/self says.
             std::os::unix::fs::symlink(std::process::id().to_string(), proc.join("self")).unwrap();
             for (pid, stat, tasks) in entries.iter() {
-                let dir = proc.join(pid);
+                let dir = proc.join(past_pid_max(pid));
                 std::fs::create_dir_all(dir.join("task")).unwrap();
                 if let Some(stat) = stat {
                     std::fs::write(dir.join("stat"), stat).unwrap();
@@ -1567,8 +1650,9 @@ mod tests {
         ];
         for (i, (name, self_link, seen)) in cases.iter().enumerate() {
             let proc = scratch.path(&format!("proc{i}"));
-            std::fs::create_dir_all(proc.join("100/task")).unwrap();
-            std::fs::write(proc.join("100/stat"), "100 (sleep) S 1 4242 4242 0").unwrap();
+            let dir = proc.join(past_pid_max("100"));
+            std::fs::create_dir_all(dir.join("task")).unwrap();
+            std::fs::write(dir.join("stat"), "100 (sleep) S 1 4242 4242 0").unwrap();
             if let Some(target) = self_link {
                 std::os::unix::fs::symlink(target, proc.join("self")).unwrap();
             }
