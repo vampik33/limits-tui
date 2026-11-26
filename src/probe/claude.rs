@@ -5,6 +5,14 @@ use super::{ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, json_f64, 
 
 pub const STATE_FILE: &str = ".local/state/herdr-claude-limits/rate_limits.json";
 
+/// How far past now a capture's `captured_at` may be. The tap stamps it with
+/// jq's `now` from this machine's clock, the one `unix_now` reads, so a real
+/// capture is never ahead unless the clock stepped back since it was written
+/// (an NTP correction: seconds, rarely more). A minute covers that and delays
+/// the `CLAUDE_STALE_SECS` dimming by at most a minute; a later timestamp
+/// (milliseconds, `1e300`) would keep a capture fresh forever.
+const CAPTURE_CLOCK_SKEW_SECS: i64 = 60;
+
 fn state_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(STATE_FILE))
 }
@@ -37,10 +45,10 @@ fn window(v: Option<&serde_json::Value>, label: &'static str) -> Result<Option<U
 
 pub fn fetch() -> ProbeResult {
     let path = state_path().ok_or_else(|| ProbeError::new(ErrorCode::Failed, "no home dir"))?;
-    fetch_from(&path)
+    fetch_from(&path, unix_now())
 }
 
-fn fetch_from(path: &std::path::Path) -> ProbeResult {
+fn fetch_from(path: &std::path::Path, now: i64) -> ProbeResult {
     let text = match read_small_file(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -50,6 +58,10 @@ fn fetch_from(path: &std::path::Path) -> ProbeResult {
     };
     let data: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| ProbeError::new(ErrorCode::Failed, e.to_string()))?;
+    // Valid JSON that isn't an object has no window keys: malformed, not NoData.
+    if !data.is_object() {
+        return Err(ProbeError::new(ErrorCode::Failed, "capture is not a JSON object"));
+    }
 
     let mut windows = Vec::new();
     if let Some(w) = window(data.get("five_hour"), "5h")? {
@@ -60,8 +72,11 @@ fn fetch_from(path: &std::path::Path) -> ProbeResult {
     }
     // Only an absent or null timestamp means now: an unreadable one read as now
     // would show an old capture as fresh.
-    let fetched_at =
-        number(&data, "captured_at", "capture has an invalid timestamp")?.map_or_else(unix_now, |f| f as i64);
+    let fetched_at = number(&data, "captured_at", "capture has an invalid timestamp")?.map_or(now, |f| f as i64);
+    // A capture from the future would never go stale.
+    if fetched_at > now.saturating_add(CAPTURE_CLOCK_SKEW_SECS) {
+        return Err(ProbeError::new(ErrorCode::Failed, "capture has an invalid timestamp"));
+    }
     if windows.is_empty() {
         return Err(ProbeError::new(ErrorCode::NoData, "no windows in capture"));
     }
@@ -124,7 +139,7 @@ mod tests {
         let scratch = Scratch::new("capture");
         let path = scratch.path("rate_limits.json");
         std::fs::write(&path, CAPTURE).unwrap();
-        assert_eq!(fetch_from(&path).unwrap().windows.len(), 1);
+        assert_eq!(fetch_from(&path, unix_now()).unwrap().windows.len(), 1);
     }
 
     #[test]
@@ -133,20 +148,23 @@ mod tests {
         let (target, link) = (scratch.path("target.json"), scratch.path("rate_limits.json"));
         std::fs::write(&target, CAPTURE).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(fetch_from(&link).unwrap().windows.len(), 1);
+        assert_eq!(fetch_from(&link, unix_now()).unwrap().windows.len(), 1);
     }
 
     #[test]
     fn missing_capture_is_no_data() {
         let scratch = Scratch::new("capturemissing");
-        assert_eq!(fetch_from(&scratch.path("rate_limits.json")).err().expect("should fail").code, ErrorCode::NoData);
+        assert_eq!(
+            fetch_from(&scratch.path("rate_limits.json"), unix_now()).err().expect("should fail").code,
+            ErrorCode::NoData
+        );
     }
 
     #[test]
     fn fifo_capture_fails_without_blocking() {
         let scratch = Scratch::new("capturefifo");
         let fifo = scratch.fifo("rate_limits.json");
-        let err = promptly(move || fetch_from(&fifo).err()).expect("should fail");
+        let err = promptly(move || fetch_from(&fifo, unix_now()).err()).expect("should fail");
         assert_eq!(err.code, ErrorCode::Failed, "{}", err.detail);
     }
 
@@ -155,16 +173,21 @@ mod tests {
         let scratch = Scratch::new("capturebig");
         let path = scratch.path("rate_limits.json");
         std::fs::write(&path, format!("{CAPTURE}{}", " ".repeat(MAX_FILE_BYTES as usize))).unwrap();
-        let err = fetch_from(&path).err().expect("should fail");
+        let err = fetch_from(&path, unix_now()).err().expect("should fail");
         assert_eq!(err.code, ErrorCode::Failed, "{}", err.detail);
     }
 
     /// fetch_from on a capture file holding `text`.
     fn fetch_text(text: &str) -> ProbeResult {
+        fetch_text_at(text, unix_now())
+    }
+
+    /// fetch_from on a capture file holding `text`, read at `now`.
+    fn fetch_text_at(text: &str, now: i64) -> ProbeResult {
         let scratch = Scratch::new("capturetext");
         let path = scratch.path("rate_limits.json");
         std::fs::write(&path, text).unwrap();
-        fetch_from(&path)
+        fetch_from(&path, now)
     }
 
     /// The detail of the Failed error fetch_from gives for `text`.
@@ -227,11 +250,116 @@ mod tests {
             ("-0.5", 0),
             ("-1.5", -1),
             // Finite but past i64: saturates, never wraps or panics.
-            ("1e300", i64::MAX),
             ("-1e300", i64::MIN),
         ] {
             let capture = format!(r#"{{"five_hour":{WINDOW},"captured_at":{at}}}"#);
             assert_eq!(fetch_text(&capture).unwrap().fetched_at, want, "{capture}");
+        }
+    }
+
+    /// A fixed now for captures read at a known time.
+    const NOW: i64 = 1_764_130_000;
+
+    #[test]
+    fn future_captured_at_fails() {
+        for at in [
+            "1764130061",
+            "1764130061.5",
+            r#"" 1764130061 ""#,
+            "1764130120",
+            "1764216400",
+            // A writer that stores milliseconds.
+            "1764130000000",
+            "1764130000000.789",
+            // Finite but past i64: saturates to i64::MAX, still in the future.
+            "1e300",
+            "9223372036854775807",
+            "1e19",
+        ] {
+            for windows in [format!(r#""five_hour":{WINDOW},"#), String::new()] {
+                let capture = format!(r#"{{{windows}"captured_at":{at}}}"#);
+                let err = fetch_text_at(&capture, NOW).err().unwrap_or_else(|| panic!("should fail: {capture}"));
+                assert_eq!(err.code, ErrorCode::Failed, "{capture}: {}", err.detail);
+                assert_eq!(err.detail, "capture has an invalid timestamp", "{capture}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_at_within_the_skew_is_kept() {
+        for (at, want) in [
+            ("1764130000", NOW),
+            ("1764130000.9", NOW),
+            ("1764130001", NOW + 1),
+            ("1764130059", NOW + 59),
+            ("1764130060", NOW + CAPTURE_CLOCK_SKEW_SECS),
+            // Truncated to whole seconds like jq's fractional `now`.
+            ("1764130060.999", NOW + CAPTURE_CLOCK_SKEW_SECS),
+            (r#""1764130060""#, NOW + CAPTURE_CLOCK_SKEW_SECS),
+            ("1764129999", NOW - 1),
+            ("0", 0),
+        ] {
+            let capture = format!(r#"{{"five_hour":{WINDOW},"captured_at":{at}}}"#);
+            let got = fetch_text_at(&capture, NOW).unwrap_or_else(|e| panic!("{capture}: {}", e.detail));
+            assert_eq!(got.fetched_at, want, "{capture}");
+        }
+    }
+
+    #[test]
+    fn captured_at_is_kept_exactly_up_to_the_skew() {
+        for offset in -2 * CAPTURE_CLOCK_SKEW_SECS..=2 * CAPTURE_CLOCK_SKEW_SECS {
+            let capture = format!(r#"{{"five_hour":{WINDOW},"captured_at":{}}}"#, NOW + offset);
+            match fetch_text_at(&capture, NOW) {
+                Ok(got) => {
+                    assert!(offset <= CAPTURE_CLOCK_SKEW_SECS, "{capture}: kept");
+                    assert_eq!(got.fetched_at, NOW + offset, "{capture}");
+                }
+                Err(e) => {
+                    assert!(offset > CAPTURE_CLOCK_SKEW_SECS, "{capture}: {}", e.detail);
+                    assert_eq!((e.code, e.detail.as_str()), (ErrorCode::Failed, "capture has an invalid timestamp"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_null_captured_at_is_the_read_time() {
+        for now in [NOW, 0, i64::MAX] {
+            for capture in
+                [format!(r#"{{"five_hour":{WINDOW}}}"#), format!(r#"{{"five_hour":{WINDOW},"captured_at":null}}"#)]
+            {
+                assert_eq!(fetch_text_at(&capture, now).unwrap().fetched_at, now, "{capture}");
+            }
+        }
+    }
+
+    #[test]
+    fn skew_check_saturates_at_an_extreme_now() {
+        // now + skew past i64 must not overflow; i64::MAX is then not ahead.
+        for at in ["1e300", "9223372036854775807"] {
+            let capture = format!(r#"{{"five_hour":{WINDOW},"captured_at":{at}}}"#);
+            assert_eq!(fetch_text_at(&capture, i64::MAX).unwrap().fetched_at, i64::MAX, "{capture}");
+        }
+    }
+
+    #[test]
+    fn non_object_capture_fails() {
+        for capture in [
+            "null",
+            " null ",
+            "[]",
+            "[{}]",
+            &format!(r#"[{{"five_hour":{WINDOW}}}]"#),
+            r#""x""#,
+            r#""""#,
+            "42",
+            "0",
+            "-1.5",
+            "1764130000",
+            "true",
+            "false",
+        ] {
+            assert_eq!(failure(capture), "capture is not a JSON object", "{capture}");
         }
     }
 
