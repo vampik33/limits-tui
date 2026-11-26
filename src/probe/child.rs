@@ -446,6 +446,16 @@ impl Children {
     }
 }
 
+/// What `run_bounded_timed` got from a child.
+pub(super) struct BoundedRun {
+    /// The last OUTPUT_CAP bytes of its stdout.
+    pub(super) stdout: Vec<u8>,
+    /// The deadline came before its output was read to the end: the child was
+    /// still running then and was killed, or had only just exited. So
+    /// `stdout` may lack what it would have printed last.
+    pub(super) timed_out: bool,
+}
+
 /// The last OUTPUT_CAP bytes of stdout of `cmd`, or None if it could not be
 /// started. Returns by `deadline`, plus up to REAP_WAIT to reap the killed
 /// child (`Children::reap_killed`). Before it returns, the child's process
@@ -460,8 +470,20 @@ pub(super) fn run_bounded(cmd: &mut Command, deadline: Instant) -> Option<Vec<u8
     run_bounded_with(&CHILDREN, cmd, deadline)
 }
 
+/// `run_bounded`, also telling whether the deadline cut the child short
+/// (`BoundedRun::timed_out`), so a caller can tell that from a child that
+/// finished without printing what it looks for.
+pub(super) fn run_bounded_timed(cmd: &mut Command, deadline: Instant) -> Option<BoundedRun> {
+    run_bounded_timed_with(&CHILDREN, cmd, deadline)
+}
+
 /// `run_bounded`, recording the child in `children`.
 fn run_bounded_with(children: &'static Children, cmd: &mut Command, deadline: Instant) -> Option<Vec<u8>> {
+    run_bounded_timed_with(children, cmd, deadline).map(|run| run.stdout)
+}
+
+/// `run_bounded_timed`, recording the child in `children`.
+fn run_bounded_timed_with(children: &'static Children, cmd: &mut Command, deadline: Instant) -> Option<BoundedRun> {
     // A non-interactive shell keeps its background jobs in this group.
     cmd.current_dir("/").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
     let mut child = children.spawn(cmd).ok()?;
@@ -492,9 +514,12 @@ fn run_bounded_with(children: &'static Children, cmd: &mut Command, deadline: In
     }
     // Killed holders release stdout at once.
     output.settle(deadline);
-    let tail = output.into_tail();
+    // Taken before the reap, which may take REAP_WAIT more: a child that
+    // finished on time is not reported cut short because its reap was slow.
+    let timed_out = Instant::now() >= deadline;
+    let stdout = output.into_tail();
     children.reap_killed(child);
-    Some(tail)
+    Some(BoundedRun { stdout, timed_out })
 }
 
 /// Whether `child` has exited, without reaping it: its pid stays reserved, so
@@ -1379,5 +1404,98 @@ mod tests {
             assert_eq!(group_has_live_member(&proc, group), *seen, "self {name}");
         }
         assert!(is_our_procfs(Path::new("/proc")), "this test's own /proc is not its pid namespace's");
+    }
+
+    /// `script` run by run_bounded_timed_with with `budget`, and how long it took.
+    fn run_timed(children: &'static Children, script: &str, budget: Duration) -> (BoundedRun, Duration) {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        let run = run_bounded_timed_with(children, &mut sh(script), start + budget).expect("not started");
+        (run, start.elapsed())
+    }
+
+    /// A child that exits by itself in time is not timed out, whatever it
+    /// printed and however it exited.
+    #[test]
+    fn run_bounded_timed_child_that_exits_by_itself_is_not_timed_out() {
+        static CHILDREN: Children = Children::new();
+        let cases: [(&str, &[u8]); 5] = [
+            ("echo ran", b"ran\n"),
+            ("printf partial", b"partial"),
+            ("exit 1", b""),
+            ("exec >&-; exit 0", b""),
+            ("kill -9 $$", b""),
+        ];
+        for (script, stdout) in cases {
+            let (run, elapsed) = run_timed(&CHILDREN, script, Duration::from_secs(5));
+            assert_eq!(run.stdout, stdout, "{script:?}");
+            assert!(!run.timed_out, "{script:?}: timed out after {elapsed:?}");
+            assert!(elapsed < Duration::from_secs(2), "{script:?}: took {elapsed:?}");
+        }
+    }
+
+    /// Jobs left holding stdout once the child has exited, in its group or
+    /// out of it (setsid), hold it only for the exit grace, which is no
+    /// timeout: the child's own output is complete.
+    #[test]
+    fn run_bounded_timed_child_whose_jobs_hold_stdout_is_not_timed_out() {
+        static CHILDREN: Children = Children::new();
+        for script in ["sleep 30 &\necho ran", "setsid sleep 2 &\necho ran"] {
+            let (run, elapsed) = run_timed(&CHILDREN, script, Duration::from_secs(5));
+            assert_eq!(run.stdout, b"ran\n", "{script:?}");
+            assert!(!run.timed_out, "{script:?}: timed out after {elapsed:?}");
+            assert!(elapsed < Duration::from_secs(2), "{script:?}: took {elapsed:?}");
+        }
+    }
+
+    /// A child still running at its deadline is timed out, keeping what it
+    /// printed before: silent, after some output, with stdout closed, with a
+    /// background job in its group, or flooding stdout.
+    #[test]
+    fn run_bounded_timed_child_still_running_at_its_deadline_is_timed_out() {
+        static CHILDREN: Children = Children::new();
+        let budget = Duration::from_millis(500);
+        let cases: [(&str, Option<&[u8]>); 5] = [
+            ("exec sleep 30", Some(b"")),
+            ("echo started; exec sleep 30", Some(b"started\n")),
+            ("exec >&-; exec sleep 30", Some(b"")),
+            ("sleep 30 &\necho started; sleep 30", Some(b"started\n")),
+            ("exec yes", None),
+        ];
+        for (script, stdout) in cases {
+            let (run, elapsed) = run_timed(&CHILDREN, script, budget);
+            assert!(run.timed_out, "{script:?}: not timed out after {elapsed:?}");
+            match stdout {
+                Some(stdout) => assert_eq!(run.stdout, stdout, "{script:?}"),
+                None => assert!(!run.stdout.is_empty() && run.stdout.len() <= OUTPUT_CAP, "{script:?}"),
+            }
+            assert!(elapsed >= budget, "{script:?}: returned before its deadline, after {elapsed:?}");
+            assert!(elapsed < budget + REAP_WAIT + Duration::from_secs(1), "{script:?}: took {elapsed:?}");
+        }
+    }
+
+    /// With its deadline already passed, nothing is read: timed out, even for
+    /// a child that would have exited at once.
+    #[test]
+    fn run_bounded_timed_with_its_deadline_passed_is_timed_out() {
+        static CHILDREN: Children = Children::new();
+        for script in ["echo ran", "exec sleep 30"] {
+            let (run, elapsed) = run_timed(&CHILDREN, script, Duration::ZERO);
+            assert!(run.timed_out, "{script:?}");
+            assert!(elapsed < REAP_WAIT + Duration::from_secs(1), "{script:?}: took {elapsed:?}");
+        }
+    }
+
+    /// A child that can't be started is None, not a run that timed out.
+    #[test]
+    fn run_bounded_timed_child_that_cannot_start_is_none() {
+        static CHILDREN: Children = Children::new();
+        let mut cmd = Command::new("/nonexistent/program");
+        assert!(run_bounded_timed_with(&CHILDREN, &mut cmd, Instant::now() + Duration::from_secs(5)).is_none());
+        CHILDREN.kill_all();
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            run_bounded_timed_with(&CHILDREN, &mut sh("echo ran"), Instant::now() + Duration::from_secs(5)).is_none()
+        );
     }
 }

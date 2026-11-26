@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use super::child::{CHILDREN, Pipe, has_exited, run_bounded};
+use super::child::{BoundedRun, CHILDREN, Pipe, has_exited, run_bounded_timed};
 use super::{
     ErrorCode, FetchOk, ProbeError, ProbeResult, UsageWindow, absolute_dirs, inherit_safe_path, json_f64, json_int,
     safe_path, timeout_from_env, unix_now,
@@ -50,8 +50,9 @@ fn is_exe(p: &std::path::Path) -> bool {
 }
 
 /// The last OUTPUT_CAP bytes of stdout of `shell -lc`, printing LOGIN_MARKER,
-/// the exported PATH (an empty line if unset) and `command -v codex`, or None
-/// if the shell could not be started. The shell inherits `ours` (our PATH)
+/// the exported PATH (an empty line if unset) and `command -v codex`, and
+/// whether its deadline cut it short, or None if the shell could not be
+/// started. The shell inherits `ours` (our PATH)
 /// as inherit_safe_path leaves it. Bounded by `shell_deadline` as
 /// `run_bounded` describes; that includes background jobs the login config
 /// leaves in the shell's process group.
@@ -59,14 +60,14 @@ fn login_shell_lookup(
     shell: &std::ffi::OsStr,
     ours: Option<&std::ffi::OsStr>,
     shell_deadline: Instant,
-) -> Option<Vec<u8>> {
+) -> Option<BoundedRun> {
     // printenv joins PATH with colons in any shell (fish's "$PATH" uses
     // spaces); `|| echo` keeps the PATH line when PATH is unset.
     let lookup = format!("printf '%s\\n' '{LOGIN_MARKER}'; printenv PATH || echo; command -v codex");
     let mut command = Command::new(shell);
     command.args(["-lc", &lookup]);
     inherit_safe_path(&mut command, ours);
-    run_bounded(&mut command, shell_deadline)
+    run_bounded_timed(&mut command, shell_deadline)
 }
 
 /// `dir` followed by `current` (a PATH value), skipping an empty `current`:
@@ -103,7 +104,9 @@ fn find_codex(deadline: Instant) -> Result<CodexBin, ProbeError> {
 /// Codex as `shell`'s login config finds it (login_shell_lookup, run with
 /// `ours`, our PATH, by `deadline` and within 5 s), or None. Fails without
 /// starting the shell while an earlier lookup's shell is stuck
-/// (`Children::spawn` refuses it): codex may be installed all the same.
+/// (`Children::spawn` refuses it), and times out when the bound cuts the
+/// lookup short before it named codex (a slow login config): either way codex
+/// may be installed all the same.
 fn codex_from_login_shell(
     shell: &std::ffi::OsStr,
     ours: Option<std::ffi::OsString>,
@@ -114,8 +117,12 @@ fn codex_from_login_shell(
     }
     // The login shell may source slow config; bound it like the Python probe.
     let shell_deadline = Instant::now() + (deadline - Instant::now()).min(Duration::from_secs(5));
-    Ok(login_shell_lookup(shell, ours.as_deref(), shell_deadline)
-        .and_then(|stdout| codex_from_login_output(&stdout, ours)))
+    let Some(run) = login_shell_lookup(shell, ours.as_deref(), shell_deadline) else { return Ok(None) };
+    match codex_from_login_output(&run.stdout, ours) {
+        Some(codex) => Ok(Some(codex)),
+        None if run.timed_out => Err(ProbeError::new(ErrorCode::Timeout, "login shell lookup timed out")),
+        None => Ok(None),
+    }
 }
 
 /// Codex as named by CODEX_BIN, made absolute against our working directory:
@@ -465,7 +472,7 @@ fn read_rate_limits(codex: &CodexBin, deadline: Instant) -> ProbeResult {
 mod tests {
     use super::*;
 
-    use crate::probe::child::REAP_WAIT;
+    use crate::probe::child::{REAP_WAIT, run_bounded};
     use crate::probe::tests::{is_our_zombie, promptly};
     use crate::probe::{SCRIPTS, wait_until};
 
@@ -518,7 +525,7 @@ mod tests {
         let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let out = login_shell_lookup(shell.as_os_str(), std::env::var_os("PATH").as_deref(), start + budget);
-        (out, start.elapsed())
+        (out.map(|run| run.stdout), start.elapsed())
     }
 
     /// The pid a test script wrote. Never 0 or negative: `kill` would read
@@ -986,7 +993,9 @@ mod tests {
         let shell = scratch.shell("printf '%s\\n' \"$PATH\"; fakenode || echo not-found");
         let run = |ours: &str| {
             let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
-            login_shell_lookup(shell.as_os_str(), Some(ours.as_ref()), Instant::now() + Duration::from_secs(5)).unwrap()
+            login_shell_lookup(shell.as_os_str(), Some(ours.as_ref()), Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .stdout
         };
         let relative = format!(".::{}:/usr/bin:/bin:", relative_to_root(&node));
         assert_eq!(run(&relative), b"/usr/bin:/bin\nnot-found\n");
@@ -1571,7 +1580,8 @@ mod tests {
         let (other_result, _) = lookup(&other, Duration::from_secs(5));
         drop(release);
         let first = first.expect("the lookup never returned");
-        assert!(matches!(first, Ok(None)), "no marker, no codex: {:?}", first.map(|c| c.map(|c| c.path)));
+        let first = first.map(|c| c.map(|c| c.path)).expect_err("a shell killed at its bound gave an answer");
+        assert_eq!(first.code, ErrorCode::Timeout, "killed at its bound: {first:?}");
         assert_eq!(started_while_stuck, 1, "a second shell was started while the first was stuck");
         let second = second.map(|c| c.map(|c| c.path)).expect_err("the stuck shell's lookup did not fail");
         assert_eq!((second.code, second.detail.as_str()), (ErrorCode::Failed, "an earlier login shell is stuck"));
@@ -1581,8 +1591,93 @@ mod tests {
         assert_eq!(other_codex.child_path.as_deref(), Some("/usr/bin:/bin".as_ref()));
         assert!(wait_until(40, || !CHILDREN.contains(pid as u32)), "shell {pid} is still in CHILDREN once released");
         let (third, _) = lookup(&shell, Duration::from_millis(300));
-        assert!(matches!(third, Ok(None)), "{:?}", third.map(|c| c.map(|c| c.path)));
+        assert_eq!(third.map(|c| c.map(|c| c.path)).map_err(|e| e.code).expect_err("no timeout"), ErrorCode::Timeout);
         assert_eq!(runs(&log).len(), 2, "the shell was not started again once reaped");
+    }
+
+    /// What codex_from_login_shell finds through `shell` with `budget`, as a
+    /// path, and how long it took.
+    fn login_codex(
+        shell: &std::path::Path,
+        budget: Duration,
+    ) -> (Result<Option<std::path::PathBuf>, ProbeError>, Duration) {
+        let _forking = SCRIPTS.read().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        let found = codex_from_login_shell(shell.as_os_str(), Some("/usr/bin:/bin".into()), start + budget);
+        (found.map(|c| c.map(|c| c.path)), start.elapsed())
+    }
+
+    /// A login shell cut off at its bound before it named codex (a slow login
+    /// config) times out rather than reporting codex missing: codex may be
+    /// installed all the same. Whether it printed nothing, only the login
+    /// config's output, our marker and PATH but not yet the answer, closed
+    /// its stdout, or left a job running in its group.
+    #[test]
+    fn login_shell_cut_off_at_its_bound_times_out_instead_of_missing() {
+        let budget = Duration::from_millis(500);
+        for body in [
+            "sleep 30".to_owned(),
+            "echo welcome\nsleep 30".to_owned(),
+            format!("printf '%s\\n' '{LOGIN_MARKER}' /usr/bin:/bin\nsleep 30"),
+            "exec >/dev/null\nsleep 30".to_owned(),
+            "sleep 30 &\nwait".to_owned(),
+        ] {
+            let scratch = Scratch::new("shellcut");
+            let (found, elapsed) = login_codex(&scratch.shell(&body), budget);
+            let Err(e) = found else { panic!("{body:?}: gave an answer: {found:?}") };
+            assert_eq!((e.code, e.detail.as_str()), (ErrorCode::Timeout, "login shell lookup timed out"), "{body:?}");
+            assert!(elapsed >= budget, "{body:?}: returned after {elapsed:?}");
+            assert!(elapsed < budget + REAP_WAIT + Duration::from_secs(1), "{body:?}: took {elapsed:?}");
+        }
+    }
+
+    /// With no time left, the lookup reads nothing and times out.
+    #[test]
+    fn login_shell_with_no_time_left_times_out() {
+        let scratch = Scratch::new("shellnotime");
+        let codex = scratch.script("bin/codex", "#!/bin/sh\n");
+        let shell = scratch.shell(&format!("printf '%s\\n' '{LOGIN_MARKER}' /usr/bin:/bin {}", codex.display()));
+        let (found, _) = login_codex(&shell, Duration::ZERO);
+        assert_eq!(found.map_err(|e| e.code), Err(ErrorCode::Timeout));
+    }
+
+    /// A login shell that finishes in time without naming codex still means
+    /// codex is missing: no marker (the login config exec'd another shell, or
+    /// it failed), or the marker but no codex after it.
+    #[test]
+    fn login_shell_that_finishes_without_codex_is_still_missing() {
+        for body in [
+            "exit 0".to_owned(),
+            "exit 1".to_owned(),
+            "echo welcome".to_owned(),
+            "echo /bin/sh".to_owned(),
+            "exec >/dev/null\nexit 0".to_owned(),
+            format!("printf '%s\\n' '{LOGIN_MARKER}' /usr/bin:/bin"),
+            "sleep 30 &\necho welcome".to_owned(),
+        ] {
+            let scratch = Scratch::new("shellnocodex");
+            let (found, elapsed) = login_codex(&scratch.shell(&body), Duration::from_secs(5));
+            assert!(matches!(found, Ok(None)), "{body:?}: {found:?}");
+            assert!(elapsed < Duration::from_secs(2), "{body:?}: took {elapsed:?}");
+        }
+        // A shell that can't be started too.
+        let (found, _) = login_codex(std::path::Path::new("/nonexistent/shell"), Duration::from_secs(5));
+        assert!(matches!(found, Ok(None)), "{found:?}");
+    }
+
+    /// A login shell that names codex resolves it, even when it then keeps
+    /// running until its bound cuts it off: the answer is complete.
+    #[test]
+    fn login_shell_that_names_codex_resolves_even_if_then_cut_off() {
+        let budget = Duration::from_millis(500);
+        for tail in ["", "\nexec sleep 30"] {
+            let scratch = Scratch::new("shellcodex");
+            let codex = scratch.script("bin/codex", "#!/bin/sh\n");
+            let shell = scratch
+                .shell(&format!("printf '%s\\n' welcome '{LOGIN_MARKER}' /usr/bin:/bin {}{tail}", codex.display()));
+            let (found, _) = login_codex(&shell, budget);
+            assert_eq!(found.map_err(|e| e.code), Ok(Some(codex)), "{tail:?}");
+        }
     }
 
     #[test]
