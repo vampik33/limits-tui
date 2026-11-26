@@ -9,10 +9,30 @@ fn state_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(STATE_FILE))
 }
 
-fn window(v: &serde_json::Value, label: &'static str) -> Option<UsageWindow> {
-    let pct = json_f64(v.get("used_percentage")?)?;
-    let resets = json_f64(v.get("resets_at")?)? as i64;
-    UsageWindow::new(label, pct, resets)
+/// The number at `key` in `v`: `None` when absent or null, Failed with
+/// `invalid` when present but not a finite number.
+fn number(v: &serde_json::Value, key: &str, invalid: &'static str) -> Result<Option<f64>, ProbeError> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(n) => match json_f64(n) {
+            Some(f) if f.is_finite() => Ok(Some(f)),
+            _ => Err(ProbeError::new(ErrorCode::Failed, invalid)),
+        },
+    }
+}
+
+/// The window `v`, if the capture has one with both fields. A window or field
+/// that is present but unreadable makes the capture malformed: Failed, not a
+/// silently dropped window.
+fn window(v: Option<&serde_json::Value>, label: &'static str) -> Result<Option<UsageWindow>, ProbeError> {
+    let v = match v {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(v) if v.is_object() => v,
+        Some(_) => return Err(ProbeError::new(ErrorCode::Failed, "capture has an invalid usage window")),
+    };
+    let pct = number(v, "used_percentage", "capture has an invalid usage percentage")?;
+    let resets = number(v, "resets_at", "capture has an invalid reset time")?;
+    Ok(pct.zip(resets).and_then(|(pct, resets)| UsageWindow::new(label, pct, resets as i64)))
 }
 
 pub fn fetch() -> ProbeResult {
@@ -32,18 +52,19 @@ fn fetch_from(path: &std::path::Path) -> ProbeResult {
         serde_json::from_str(&text).map_err(|e| ProbeError::new(ErrorCode::Failed, e.to_string()))?;
 
     let mut windows = Vec::new();
-    if let Some(w) = window(&data["five_hour"], "5h") {
+    if let Some(w) = window(data.get("five_hour"), "5h")? {
         windows.push(w);
     }
-    if let Some(w) = window(&data["seven_day"], "7d") {
+    if let Some(w) = window(data.get("seven_day"), "7d")? {
         windows.push(w);
     }
+    // Only an absent or null timestamp means now: an unreadable one read as now
+    // would show an old capture as fresh.
+    let fetched_at =
+        number(&data, "captured_at", "capture has an invalid timestamp")?.map_or_else(unix_now, |f| f as i64);
     if windows.is_empty() {
         return Err(ProbeError::new(ErrorCode::NoData, "no windows in capture"));
     }
-    let fetched_at = json_f64(data.get("captured_at").unwrap_or(&serde_json::Value::Null))
-        .map(|f| f as i64)
-        .unwrap_or_else(unix_now);
     Ok(FetchOk { windows, plan: None, overage_micros: None, fetched_at })
 }
 
@@ -56,14 +77,17 @@ mod tests {
     /// The percent of a window read with this `used_percentage`, as bits so
     /// -0.0 and 0.0 differ.
     fn percent(used: serde_json::Value) -> Option<u64> {
-        window(&serde_json::json!({"used_percentage": used, "resets_at": 1_800_000_000}), "5h")
+        window(Some(&serde_json::json!({"used_percentage": used, "resets_at": 1_800_000_000})), "5h")
+            .expect("a finite percent is readable")
             .map(|w| w.used_percent.to_bits())
     }
 
     #[test]
-    fn non_finite_percent_drops_the_window() {
+    fn non_finite_percent_fails() {
         for used in ["NaN", "-nan", "inf", "-inf", "infinity", "+Infinity"] {
-            assert_eq!(percent(used.into()), None, "{used}");
+            let v = serde_json::json!({"used_percentage": used, "resets_at": 1_800_000_000});
+            let err = window(Some(&v), "5h").err().expect(used);
+            assert_eq!(err.code, ErrorCode::Failed, "{used}: {}", err.detail);
         }
     }
 
@@ -133,5 +157,163 @@ mod tests {
         std::fs::write(&path, format!("{CAPTURE}{}", " ".repeat(MAX_FILE_BYTES as usize))).unwrap();
         let err = fetch_from(&path).err().expect("should fail");
         assert_eq!(err.code, ErrorCode::Failed, "{}", err.detail);
+    }
+
+    /// fetch_from on a capture file holding `text`.
+    fn fetch_text(text: &str) -> ProbeResult {
+        let scratch = Scratch::new("capturetext");
+        let path = scratch.path("rate_limits.json");
+        std::fs::write(&path, text).unwrap();
+        fetch_from(&path)
+    }
+
+    /// The detail of the Failed error fetch_from gives for `text`.
+    fn failure(text: &str) -> String {
+        let err = fetch_text(text).err().unwrap_or_else(|| panic!("should fail: {text}"));
+        assert_eq!(err.code, ErrorCode::Failed, "{text}: {}", err.detail);
+        err.detail
+    }
+
+    const WINDOW: &str = r#"{"used_percentage":1,"resets_at":2}"#;
+
+    /// Present values that aren't a finite number, as JSON text.
+    const UNREADABLE: [&str; 14] = [
+        r#""x""#,
+        r#""""#,
+        r#""NaN""#,
+        r#""inf""#,
+        r#""-infinity""#,
+        r#""1e400""#,
+        "{}",
+        r#"{"n":1}"#,
+        "[]",
+        "[1700000000]",
+        "true",
+        "false",
+        "1e400",
+        "-1e400",
+    ];
+
+    #[test]
+    fn unreadable_captured_at_fails() {
+        for at in UNREADABLE {
+            for windows in [format!(r#""five_hour":{WINDOW},"#), String::new()] {
+                let capture = format!(r#"{{{windows}"captured_at":{at}}}"#);
+                assert_eq!(failure(&capture), "capture has an invalid timestamp", "{capture}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_null_captured_at_is_now() {
+        for capture in
+            [format!(r#"{{"five_hour":{WINDOW}}}"#), format!(r#"{{"five_hour":{WINDOW},"captured_at":null}}"#)]
+        {
+            let before = unix_now();
+            let at = fetch_text(&capture).unwrap().fetched_at;
+            assert!((before..=unix_now()).contains(&at), "{capture}: {at}");
+        }
+    }
+
+    #[test]
+    fn readable_captured_at_is_kept() {
+        for (at, want) in [
+            ("1764130000", 1_764_130_000),
+            // jq's `now`, which the tap writes, is fractional.
+            ("1764130000.789", 1_764_130_000),
+            ("1.7641300007e9", 1_764_130_000),
+            (r#"" 1764130000.5 ""#, 1_764_130_000),
+            ("0", 0),
+            ("-0.5", 0),
+            ("-1.5", -1),
+            // Finite but past i64: saturates, never wraps or panics.
+            ("1e300", i64::MAX),
+            ("-1e300", i64::MIN),
+        ] {
+            let capture = format!(r#"{{"five_hour":{WINDOW},"captured_at":{at}}}"#);
+            assert_eq!(fetch_text(&capture).unwrap().fetched_at, want, "{capture}");
+        }
+    }
+
+    #[test]
+    fn unreadable_window_field_fails() {
+        for bad in UNREADABLE {
+            for (field, detail) in [
+                (format!(r#"{{"used_percentage":{bad},"resets_at":2}}"#), "capture has an invalid usage percentage"),
+                (format!(r#"{{"used_percentage":{bad}}}"#), "capture has an invalid usage percentage"),
+                (format!(r#"{{"used_percentage":1,"resets_at":{bad}}}"#), "capture has an invalid reset time"),
+                (format!(r#"{{"resets_at":{bad}}}"#), "capture has an invalid reset time"),
+                (format!(r#"{{"used_percentage":null,"resets_at":{bad}}}"#), "capture has an invalid reset time"),
+            ] {
+                // Alone, or beside a readable window that must not hide it.
+                for capture in [
+                    format!(r#"{{"five_hour":{field}}}"#),
+                    format!(r#"{{"five_hour":{field},"seven_day":{WINDOW}}}"#),
+                    format!(r#"{{"five_hour":{WINDOW},"seven_day":{field}}}"#),
+                    format!(r#"{{"five_hour":{WINDOW},"seven_day":{field},"captured_at":1764130000}}"#),
+                ] {
+                    assert_eq!(failure(&capture), detail, "{capture}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_object_window_fails() {
+        for bad in ["1", "0", r#""x""#, r#""""#, "[]", "[1,2]", "true", "false"] {
+            for capture in [
+                format!(r#"{{"five_hour":{bad}}}"#),
+                format!(r#"{{"seven_day":{bad}}}"#),
+                format!(r#"{{"five_hour":{WINDOW},"seven_day":{bad}}}"#),
+                format!(r#"{{"five_hour":{bad},"seven_day":{WINDOW}}}"#),
+            ] {
+                assert_eq!(failure(&capture), "capture has an invalid usage window", "{capture}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_null_window_or_field_is_skipped() {
+        for (five_hour, windows) in [
+            ("null", vec!["7d"]),
+            (r#"{"used_percentage":null,"resets_at":2}"#, vec!["7d"]),
+            (r#"{"used_percentage":1,"resets_at":null}"#, vec!["7d"]),
+            (r#"{"resets_at":2}"#, vec!["7d"]),
+            (r#"{"used_percentage":1}"#, vec!["7d"]),
+            ("{}", vec!["7d"]),
+            (WINDOW, vec!["5h", "7d"]),
+        ] {
+            let capture = format!(r#"{{"five_hour":{five_hour},"seven_day":{WINDOW},"captured_at":null}}"#);
+            let labels: Vec<_> = fetch_text(&capture).unwrap().windows.iter().map(|w| w.label).collect();
+            assert_eq!(labels, windows, "{capture}");
+        }
+        let labels: Vec<_> =
+            fetch_text(&format!(r#"{{"seven_day":{WINDOW}}}"#)).unwrap().windows.iter().map(|w| w.label).collect();
+        assert_eq!(labels, ["7d"]);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let capture = format!(r#"{{"five_hour":{WINDOW},"ten_day":"x","other":{{"resets_at":"x"}}}}"#);
+        assert_eq!(fetch_text(&capture).unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn capture_without_readable_windows_is_no_data() {
+        for capture in [
+            "{}",
+            r#"{"captured_at":1764130000}"#,
+            r#"{"five_hour":null,"seven_day":null}"#,
+            r#"{"five_hour":{"resets_at":2},"seven_day":{}}"#,
+        ] {
+            let err = fetch_text(capture).err().unwrap_or_else(|| panic!("should fail: {capture}"));
+            assert_eq!(err.code, ErrorCode::NoData, "{capture}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn fractional_window_fields_are_read() {
+        let w = fetch_text(r#"{"five_hour":{"used_percentage":"42.5","resets_at":1800000000.9}}"#).unwrap();
+        assert_eq!((w.windows[0].used_percent, w.windows[0].resets_at), (42.5, 1_800_000_000));
     }
 }
